@@ -442,8 +442,8 @@ MIT License - See LICENSE file
 
 ## 👤 Author
 
-Robert Brodie  
-For questions or collaboration: robertbrodie@example.com
+Robby Brodie  
+For questions or collaboration: robbytherobot@redhat.com
 
 ## 🙏 Acknowledgments
 
