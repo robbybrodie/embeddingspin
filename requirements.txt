@@ -1,11 +1,34 @@
 # Temporal-Phase Spin Retrieval System
 # Requirements for Python 3.8+
+#
+# ==============================================================================
+# IMPORTANT: External Services vs. Python Packages
+# ==============================================================================
+#
+# This file lists PYTHON PACKAGES to install with pip.
+# It does NOT include external services like LlamaStack or PostgreSQL.
+#
+# EXTERNAL SERVICES (not in this file):
+#
+# 1. LlamaStack Model Gateway (OPTIONAL - for production embeddings)
+#    - This is a separate service from Red Hat AI 3
+#    - Runs on its own server (typically http://host:8000)
+#    - NOT a Python package - it's an API service you connect to
+#    - Installation: See Red Hat AI 3 / LlamaStack documentation
+#    - For testing: Set USE_MOCK_EMBEDDINGS=true to skip this requirement
+#
+# 2. PostgreSQL with pgvector (OPTIONAL - for production vector storage)
+#    - Database server for large-scale deployments
+#    - Installation: See PREREQUISITES.md or DEPLOYMENT.md
+#    - For testing: Use in-memory or Chroma vector stores instead
+#
+# ==============================================================================
 
 # Core dependencies
 numpy>=1.21.0
 python-dateutil>=2.8.2
 
-# HTTP client for LlamaStack API
+# HTTP client for making API calls to LlamaStack
 httpx>=0.24.0
 
 # FastAPI server
@@ -26,4 +49,24 @@ pytest-asyncio>=0.21.0
 
 # Optional: Better CLI experience
 rich>=13.0.0
+
+# ==============================================================================
+# QUICK START GUIDE
+# ==============================================================================
+#
+# Install all Python dependencies:
+#   pip install -r requirements.txt
+#
+# Run demo (no external services needed):
+#   export USE_MOCK_EMBEDDINGS=true
+#   python demo.py
+#
+# For production with LlamaStack:
+#   export USE_MOCK_EMBEDDINGS=false
+#   export LLAMASTACK_URL=http://your-llamastack-host:8000
+#   export EMBEDDING_MODEL=text-embedding-v1
+#   python demo.py
+#
+# See PREREQUISITES.md for complete setup instructions.
+# ==============================================================================
 
