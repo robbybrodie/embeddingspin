@@ -20,8 +20,11 @@ via geometric augmentation, making this approach model-agnostic.
 Temporal Zoom:
 --------------
 β acts as a "zoom knob":
-  - β ≈ 0: broad semantic search across all time periods
-  - β > 10: sharp temporal focus around query timestamp
+  - β = 0: Pure semantic search (time ignored)
+  - β = 100: Weak temporal preference
+  - β = 1000: Moderate temporal focus
+  - β = 5000: Strong temporal focus (exact year prioritized) [DEFAULT]
+  - β = 10000+: Extreme temporal filter
   - score = semantic_sim × exp(-β × (Δφ)²)
 """
 
