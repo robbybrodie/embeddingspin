@@ -50,11 +50,11 @@ class TemporalSearchRequest(BaseModel):
         example="2016-06-30T00:00:00Z"
     )
     beta: float = Field(
-        5.0,
-        description="Temporal zoom factor (0=no time focus, 10+=sharp focus)",
-        example=5.0,
+        5000.0,
+        description="Temporal zoom factor (0=pure semantic, 100=weak, 1000=moderate, 5000=strong [default], 10000+=extreme)",
+        example=5000.0,
         ge=0.0,
-        le=100.0
+        le=10000.0
     )
     top_k: int = Field(
         10,
@@ -232,8 +232,10 @@ async def temporal_search(request: TemporalSearchRequest):
     
     Try different β values:
     - β = 0: Pure semantic search (time ignored)
-    - β = 5: Balanced semantic + temporal
-    - β = 20: Strong temporal focus
+    - β = 100: Weak temporal preference
+    - β = 1000: Moderate temporal focus
+    - β = 5000: Strong temporal focus (exact year prioritized) [DEFAULT]
+    - β = 10000: Extreme temporal filter
     
     No model retraining required - β is a runtime parameter!
     """
