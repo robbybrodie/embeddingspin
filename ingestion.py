@@ -49,7 +49,7 @@ class TemporalSpinIngestionPipeline:
         vector_store: VectorStore,
         t0_seconds: float = T0_SECONDS,
         period_seconds: float = PERIOD_SECONDS,
-        spin_weight: float = 1.0
+        temporal_scale: float = 1.0
     ):
         """
         Initialize ingestion pipeline.
@@ -58,14 +58,16 @@ class TemporalSpinIngestionPipeline:
             embedding_client: Client for obtaining semantic embeddings
             vector_store: Vector database for storage
             t0_seconds: Base epoch for timestamp normalization
-            period_seconds: Period for spin encoding (default: 10 years)
-            spin_weight: Scaling factor for spin vector (default: 1.0)
+            period_seconds: Period for spin encoding (default: 1000 years)
+            temporal_scale: Scaling factor for spin vector (default: 1.0)
+                           Note: Has no effect on cosine similarity (scale-invariant).
+                           Use β parameter in retrieval for temporal control instead.
         """
         self.embedding_client = embedding_client
         self.vector_store = vector_store
         self.t0_seconds = t0_seconds
         self.period_seconds = period_seconds
-        self.spin_weight = spin_weight
+        self.temporal_scale = temporal_scale
     
     def ingest_document(
         self,
@@ -104,19 +106,18 @@ class TemporalSpinIngestionPipeline:
         # Get semantic embedding from LlamaStack
         semantic_embedding = self.embedding_client.embed_single(text)
         
-        # Compute temporal spin vector
+        # Compute temporal spin vector with scaling
         timestamp_seconds = timestamp.timestamp()
         spin_vector, phi = compute_spin_vector(
             timestamp_seconds,
             self.t0_seconds,
-            self.period_seconds
+            self.period_seconds,
+            temporal_scale=self.temporal_scale
         )
         
-        # Scale spin vector by weight
-        weighted_spin = [self.spin_weight * x for x in spin_vector]
-        
-        # Concatenate: full_embedding = [semantic_embedding, weighted_spin]
-        full_embedding = semantic_embedding + weighted_spin
+        # Concatenate: full_embedding = [semantic_embedding, scaled_spin_vector]
+        # The spin vector is already scaled by temporal_scale inside compute_spin_vector
+        full_embedding = semantic_embedding + spin_vector
         
         # Create SpinDocument
         doc = SpinDocument(
@@ -182,17 +183,17 @@ class TemporalSpinIngestionPipeline:
         # Create SpinDocument objects
         documents = []
         for i in range(n):
-            # Compute spin vector
+            # Compute spin vector with scaling
             timestamp_seconds = resolved_timestamps[i].timestamp()
             spin_vector, phi = compute_spin_vector(
                 timestamp_seconds,
                 self.t0_seconds,
-                self.period_seconds
+                self.period_seconds,
+                temporal_scale=self.temporal_scale
             )
             
-            # Scale and concatenate
-            weighted_spin = [self.spin_weight * x for x in spin_vector]
-            full_embedding = semantic_embeddings[i] + weighted_spin
+            # Concatenate (spin vector is already scaled)
+            full_embedding = semantic_embeddings[i] + spin_vector
             
             # Create document
             doc = SpinDocument(

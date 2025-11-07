@@ -57,14 +57,19 @@ class TemporalSpinRetriever:
     ---------------------------------
     - β = 0: Pure semantic search (time ignored)
     - β = 1: Slight temporal preference
-    - β = 5: Moderate temporal focus
-    - β = 10: Strong temporal focus
-    - β = 20+: Very sharp temporal filter (almost phase-locked)
+    - β = 10: Moderate temporal focus
+    - β = 50: Strong temporal focus (±1-2 years) [DEFAULT]
+    - β = 100+: Very sharp temporal filter (almost exact year match)
     
     The temporal alignment factor is exp(-β × (Δφ)²), which:
     - Equals 1.0 when Δφ = 0 (perfect alignment)
     - Decays smoothly as phases diverge
     - Decays faster with larger β (sharper focus)
+    
+    Note: Adjacent years with high semantic similarity may rank higher than
+    exact year matches. This is correct behavior - the system balances both
+    semantic relevance and temporal alignment. Increase β if strict temporal
+    matching is required.
     """
     
     def __init__(
@@ -74,7 +79,8 @@ class TemporalSpinRetriever:
         t0_seconds: float = T0_SECONDS,
         period_seconds: float = PERIOD_SECONDS,
         default_lambda: float = 1.0,
-        default_beta: float = 5.0
+        default_beta: float = 50.0,
+        temporal_scale: float = 1.0
     ):
         """
         Initialize retriever.
@@ -86,6 +92,9 @@ class TemporalSpinRetriever:
             period_seconds: Period for spin cycles
             default_lambda: Default weight for spin in Pass 1 (coarse recall)
             default_beta: Default zoom factor for Pass 2 (re-ranking)
+            temporal_scale: Scaling factor for spin vectors (default: 1.0)
+                           Note: Has no effect on cosine similarity (scale-invariant).
+                           Must match the temporal_scale used during ingestion
         """
         self.embedding_client = embedding_client
         self.vector_store = vector_store
@@ -93,6 +102,7 @@ class TemporalSpinRetriever:
         self.period_seconds = period_seconds
         self.default_lambda = default_lambda
         self.default_beta = default_beta
+        self.temporal_scale = temporal_scale
     
     def create_query(
         self,
@@ -123,12 +133,13 @@ class TemporalSpinRetriever:
         # Get semantic embedding
         semantic_embedding = self.embedding_client.embed_single(query_text)
         
-        # Compute spin vector
+        # Compute spin vector with scaling (must match ingestion scaling)
         query_seconds = query_timestamp.timestamp()
         spin_vector, phi = compute_spin_vector(
             query_seconds,
             self.t0_seconds,
-            self.period_seconds
+            self.period_seconds,
+            temporal_scale=self.temporal_scale
         )
         
         # Create query object (handles concatenation internally)

@@ -41,8 +41,10 @@ from dateutil import parser as dateutil_parser
 T0_EPOCH = datetime(2010, 1, 1, tzinfo=timezone.utc)
 T0_SECONDS = T0_EPOCH.timestamp()
 
-# Period for spin encoding (365.25 days × 10 years = 10-year cycle)
-PERIOD_SECONDS = 365.25 * 24 * 3600 * 10
+# Period for spin encoding (365.25 days × 1000 years)
+# This ensures documents within a millennium have unique phase angles
+# With float64 precision, we can distinguish timestamps down to milliseconds
+PERIOD_SECONDS = 365.25 * 24 * 3600 * 1000
 
 # Default embedding dimension (adjust based on your model)
 DEFAULT_EMBEDDING_DIM = 384
@@ -56,10 +58,11 @@ def compute_spin_vector(
     timestamp_seconds: float,
     t0_seconds: float = T0_SECONDS,
     period_seconds: float = PERIOD_SECONDS,
-    phase_offset: float = 0.0
+    phase_offset: float = 0.0,
+    temporal_scale: float = 1.0
 ) -> Tuple[List[float], float]:
     """
-    Map a timestamp to a unit-circle spin vector.
+    Map a timestamp to a unit-circle spin vector with optional scaling.
     
     The timestamp is normalized to a fraction of the period, then converted
     to an angle φ ∈ [0, 2π). This creates a continuous, periodic representation
@@ -68,16 +71,25 @@ def compute_spin_vector(
     Args:
         timestamp_seconds: Unix timestamp in seconds
         t0_seconds: Base epoch timestamp (default: 2010-01-01)
-        period_seconds: Period length for full rotation (default: 10 years)
+        period_seconds: Period length for full rotation (default: 1000 years)
         phase_offset: Optional phase shift in radians
+        temporal_scale: Scaling factor for spin vector magnitude (default: 1.0)
+                       NOTE: Has no effect on cosine similarity (scale-invariant).
+                       Kept for API consistency. Use β in retrieval for temporal control.
     
     Returns:
-        (spin_vector, phi): A 2D unit vector [cos(φ), sin(φ)] and angle φ
+        (spin_vector, phi): Scaled 2D vector [scale*cos(φ), scale*sin(φ)] and angle φ
     
     Example:
         >>> t = datetime(2015, 1, 1, tzinfo=timezone.utc).timestamp()
-        >>> spin, phi = compute_spin_vector(t)
-        >>> # Documents 10 years apart have the same spin (periodic)
+        >>> spin, phi = compute_spin_vector(t, temporal_scale=1.0)
+        >>> # Spin vector on unit circle (default)
+    
+    Note on Temporal Control:
+        Since cosine similarity is scale-invariant (only direction matters, not magnitude),
+        temporal_scale has NO effect on retrieval ranking. To control temporal influence:
+        - Use β parameter in re-ranking: exp(-β × (Δφ)²)
+        - Or extract year from query and boost exact matches
     """
     if period_seconds <= 0:
         raise ValueError("period_seconds must be positive")
@@ -89,7 +101,11 @@ def compute_spin_vector(
     phi = math.tau * fraction + phase_offset  # tau = 2π
     
     # Spin vector on unit circle
-    spin_vector = [math.cos(phi), math.sin(phi)]
+    cos_phi = math.cos(phi)
+    sin_phi = math.sin(phi)
+    
+    # Apply temporal scaling
+    spin_vector = [temporal_scale * cos_phi, temporal_scale * sin_phi]
     
     return spin_vector, phi
 
