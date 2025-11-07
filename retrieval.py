@@ -56,20 +56,22 @@ class TemporalSpinRetriever:
     β Parameter (Temporal Zoom Knob):
     ---------------------------------
     - β = 0: Pure semantic search (time ignored)
-    - β = 1: Slight temporal preference
-    - β = 10: Moderate temporal focus
-    - β = 50: Strong temporal focus (±1-2 years) [DEFAULT]
-    - β = 100+: Very sharp temporal filter (almost exact year match)
+    - β = 10: Weak temporal preference (~1% penalty per year)
+    - β = 100: Moderate temporal focus (~4% penalty per year)
+    - β = 500: Strong temporal focus (~20% penalty per year)
+    - β = 5000: Very strong (exact year prioritized) [DEFAULT]
+    - β = 10000+: Extreme (only exact year matches score well)
     
-    The temporal alignment factor is exp(-β × (Δφ)²), which:
-    - Equals 1.0 when Δφ = 0 (perfect alignment)
-    - Decays smoothly as phases diverge
-    - Decays faster with larger β (sharper focus)
+    The temporal alignment factor is exp(-β × (Δφ)²), where Δφ = 0.0063 rad per year.
     
-    Note: Adjacent years with high semantic similarity may rank higher than
-    exact year matches. This is correct behavior - the system balances both
-    semantic relevance and temporal alignment. Increase β if strict temporal
-    matching is required.
+    Penalty for 1 year offset (0.36°):
+    - β=100:  -3.9% (gentle, semantic often wins)
+    - β=500:  -19.5% (balanced)
+    - β=5000: -82% (temporal dominates)
+    
+    Note: High β values (1000-10000) are needed to overcome semantic differences
+    between adjacent years. Lower β allows semantic similarity to dominate.
+    For strict year matching, use β ≥ 5000.
     """
     
     def __init__(
@@ -79,7 +81,7 @@ class TemporalSpinRetriever:
         t0_seconds: float = T0_SECONDS,
         period_seconds: float = PERIOD_SECONDS,
         default_lambda: float = 1.0,
-        default_beta: float = 50.0,
+        default_beta: float = 5000.0,
         temporal_scale: float = 1.0
     ):
         """
