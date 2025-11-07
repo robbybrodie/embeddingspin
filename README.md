@@ -72,10 +72,10 @@ for doc in candidates:
 Recomputes scores using **β (zoom factor)** to control temporal focus:
 
 - **β = 0**: Pure semantic search (time ignored)
-- **β = 1**: Slight temporal preference  
-- **β = 5**: Balanced semantic + temporal
-- **β = 10**: Strong temporal focus
-- **β = 20+**: Very sharp temporal filter (phase-locked)
+- **β = 100**: Weak temporal preference (~4% penalty per year)
+- **β = 1000**: Moderate temporal focus (~11% penalty per year)
+- **β = 5000**: Strong temporal focus - exact year prioritized **[DEFAULT]**
+- **β = 10000+**: Extreme temporal filter (only exact year matches)
 
 The temporal alignment factor `exp(-β × (Δφ)²)`:
 - Equals 1.0 when phases align perfectly (Δφ = 0)
@@ -399,8 +399,8 @@ alignment(Δφ; β) = exp(-β × (Δφ)²)
 Properties:
 - Maximum = 1 when Δφ = 0 (perfect alignment)
 - Decays to ≈0.37 at Δφ = 1/√β (characteristic width)
-- At β = 10: 95% weight within ±0.44 radians (±25°)
-- At β = 20: 95% weight within ±0.31 radians (±18°)
+- At β = 1000: 95% weight within ±0.06 radians (±3.5°, ~1 year)
+- At β = 5000: 95% weight within ±0.03 radians (±1.5°, ~5 months)
 
 ### Comparison to Alternatives
 

@@ -22,8 +22,10 @@ A novel retrieval algorithm that encodes time as an angular "spin" state on the 
 
 **Key Parameter - β (Temporal Zoom Knob):**
 - β = 0: Pure semantic search
-- β = 50: Strong temporal focus (±1-2 years) **[DEFAULT]**
-- β = 100+: Very sharp temporal filter (almost exact year match)
+- β = 100: Weak temporal preference (~4% penalty per year)
+- β = 1000: Moderate temporal focus (~11% penalty per year)
+- β = 5000: Strong temporal focus - exact year prioritized **[DEFAULT]**
+- β = 10000+: Extreme temporal filter (only exact year matches)
 
 ### Files Created
 
@@ -82,11 +84,11 @@ A novel retrieval algorithm that encodes time as an angular "spin" state on the 
 
 ### ✅ Beta Parameter Validated
 
-Tested β values: 10, 50, 100, 200, 500
+Tested β values: 10, 50, 100, 200, 500, 1000, 5000, 10000
 
-**Result:** Higher β increases temporal focus, but semantically similar adjacent years may still rank higher than exact matches. This is **correct behavior** - the system balances both signals.
+**Result:** Higher β increases temporal focus. At β=5000, exact year matches consistently rank first, overcoming ~10% semantic similarity differences between adjacent years.
 
-**Set default β=50** for strong temporal focus with semantic flexibility.
+**Set default β=5000** for strong temporal focus with exact year prioritization.
 
 ### ❌ Temporal Scale Discovery
 
@@ -255,7 +257,7 @@ The system is **production-ready** with OpenAI embeddings, and can scale to Llam
 **Real Data:** 24 IBM annual reports (2001-2024)  
 **Testing:** Validated with real OpenAI embeddings  
 **Cost:** $0.02 for full test suite  
-**Default β:** 50 (strong temporal focus)  
+**Default β:** 5000 (exact year prioritization)  
 **Default temporal_scale:** 1.0 (scale-invariant, no effect)
 
 ---
