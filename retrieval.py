@@ -30,6 +30,8 @@ from temporal_spin import (
     RetrievalResult,
     compute_spin_vector,
     angular_difference,
+    arc_overlap,
+    jaccard_similarity_arcs,
     cosine_similarity,
     T0_SECONDS,
     PERIOD_SECONDS
@@ -110,18 +112,20 @@ class TemporalSpinRetriever:
         self,
         query_text: str,
         query_timestamp: Optional[datetime] = None,
-        lambda_factor: Optional[float] = None
+        lambda_factor: Optional[float] = None,
+        end_timestamp: Optional[datetime] = None
     ) -> SpinQuery:
         """
-        Create a SpinQuery with temporal encoding.
+        Create a SpinQuery with temporal encoding (point or arc mode).
         
         Args:
             query_text: Query string
-            query_timestamp: Target timestamp (default: now)
+            query_timestamp: Target timestamp (default: now, start for arcs)
             lambda_factor: Weight for spin component (default: self.default_lambda)
+            end_timestamp: Optional end timestamp for arc queries
         
         Returns:
-            SpinQuery with embeddings and spin encoding
+            SpinQuery with embeddings and spin encoding (point or arc)
         """
         if query_timestamp is None:
             query_timestamp = datetime.now(timezone.utc)
@@ -135,13 +139,16 @@ class TemporalSpinRetriever:
         # Get semantic embedding
         semantic_embedding = self.embedding_client.embed_single(query_text)
         
-        # Compute spin vector with scaling (must match ingestion scaling)
+        # Compute spin vector (point or arc mode, must match ingestion)
         query_seconds = query_timestamp.timestamp()
-        spin_vector, phi = compute_spin_vector(
+        end_seconds = end_timestamp.timestamp() if end_timestamp else None
+        
+        spin_vector, phi_center, phi_start, phi_end = compute_spin_vector(
             query_seconds,
             self.t0_seconds,
             self.period_seconds,
-            temporal_scale=self.temporal_scale
+            temporal_scale=self.temporal_scale,
+            end_timestamp_seconds=end_seconds
         )
         
         # Create query object (handles concatenation internally)
@@ -150,8 +157,12 @@ class TemporalSpinRetriever:
             query_timestamp=query_timestamp,
             semantic_embedding=semantic_embedding,
             spin_vector=spin_vector,
-            phi=phi,
-            lambda_factor=lambda_factor
+            phi=phi_center,
+            lambda_factor=lambda_factor,
+            end_timestamp=end_timestamp,
+            phi_start=phi_start,
+            phi_end=phi_end,
+            is_arc=(end_timestamp is not None)
         )
         
         return query
@@ -163,7 +174,8 @@ class TemporalSpinRetriever:
         beta: Optional[float] = None,
         lambda_coarse: float = 0.1,
         top_k_coarse: int = 50,
-        top_k_final: int = 10
+        top_k_final: int = 10,
+        end_timestamp: Optional[datetime] = None
     ) -> List[RetrievalResult]:
         """
         Execute two-pass temporal-phase spin retrieval.
@@ -184,11 +196,12 @@ class TemporalSpinRetriever:
         
         Args:
             query_text: Query string
-            query_timestamp: Target timestamp for retrieval
+            query_timestamp: Target timestamp for retrieval (start for arcs)
             beta: Zoom factor for temporal focus (default: self.default_beta)
             lambda_coarse: Spin weight for coarse recall (default: 0.1)
             top_k_coarse: Number of candidates from Pass 1 (default: 50)
             top_k_final: Number of final results to return (default: 10)
+            end_timestamp: Optional end timestamp for arc queries
         
         Returns:
             List of RetrievalResult objects, sorted by combined score
@@ -204,7 +217,8 @@ class TemporalSpinRetriever:
         query = self.create_query(
             query_text=query_text,
             query_timestamp=query_timestamp,
-            lambda_factor=lambda_coarse
+            lambda_factor=lambda_coarse,
+            end_timestamp=end_timestamp
         )
         
         # Retrieve top-K candidates from vector store
@@ -217,7 +231,7 @@ class TemporalSpinRetriever:
             return []
         
         # ====================================================================
-        # PASS 2: TEMPORAL ZOOM RE-RANKING
+        # PASS 2: TEMPORAL ZOOM RE-RANKING (Arc-aware)
         # ====================================================================
         
         results = []
@@ -228,13 +242,36 @@ class TemporalSpinRetriever:
                 doc.semantic_embedding
             )
             
-            # Compute phase difference (smallest angular distance)
-            delta_phi = angular_difference(query.phi, doc.phi)
-            
-            # Temporal alignment factor: exp(-β × (Δφ)²)
-            # This is maximized (= 1.0) when phases are aligned (Δφ = 0)
-            # and decays smoothly as phases diverge
-            temporal_alignment = math.exp(-beta * (delta_phi ** 2))
+            # Compute temporal alignment based on point/arc types
+            if query.is_arc and doc.is_arc:
+                # Arc-to-arc: Use Jaccard similarity
+                temporal_alignment = jaccard_similarity_arcs(
+                    query.phi_start, query.phi_end,
+                    doc.phi_start, doc.phi_end
+                )
+                delta_phi = 0.0  # Arc overlap is the primary metric
+            elif query.is_arc and not doc.is_arc:
+                # Arc-to-point: Check if point falls within query arc
+                overlap = arc_overlap(query.phi_start, query.phi_end, doc.phi, doc.phi)
+                if overlap > 0:
+                    temporal_alignment = 1.0  # Point is within arc
+                else:
+                    # Point outside arc: use distance to arc center
+                    delta_phi = angular_difference(query.phi, doc.phi)
+                    temporal_alignment = math.exp(-beta * (delta_phi ** 2))
+            elif not query.is_arc and doc.is_arc:
+                # Point-to-arc: Check if query point falls within doc arc
+                overlap = arc_overlap(doc.phi_start, doc.phi_end, query.phi, query.phi)
+                if overlap > 0:
+                    temporal_alignment = 1.0  # Query point is within arc
+                else:
+                    # Query point outside arc: use distance to arc center
+                    delta_phi = angular_difference(query.phi, doc.phi)
+                    temporal_alignment = math.exp(-beta * (delta_phi ** 2))
+            else:
+                # Point-to-point: Use standard angular difference (legacy mode)
+                delta_phi = angular_difference(query.phi, doc.phi)
+                temporal_alignment = math.exp(-beta * (delta_phi ** 2))
             
             # Combined score: semantic similarity weighted by temporal alignment
             combined_score = semantic_score * temporal_alignment
@@ -249,11 +286,44 @@ class TemporalSpinRetriever:
                 phi_query=query.phi,
                 phi_difference=delta_phi,
                 temporal_alignment=temporal_alignment,
-                combined_score=combined_score
+                combined_score=combined_score,
+                metadata=doc.metadata
             )
             results.append(result)
         
-        # Sort by combined score (descending)
+        # ====================================================================
+        # PASS 3: PRIORITY BOOST (based on chunk_type metadata)
+        # ====================================================================
+        # Apply multipliers to prioritize structured data over narrative
+        PRIORITY_MULTIPLIERS = {
+            'fact': 3.0,          # 3.0x - Structured XBRL facts (highest priority)
+            'footnote': 2.0,      # 2.0x - Footnote disclosures
+            'financial_table': 1.5,  # 1.5x - Financial statement tables
+            'narrative': 1.0,     # 1.0x - General narrative (baseline)
+            'legacy': 1.0         # 1.0x - Documents without chunk_type (baseline)
+        }
+        
+        for result in results:
+            # Get chunk_type from document metadata
+            chunk_type = 'legacy'  # default
+            doc_id_to_find = result.doc_id if hasattr(result, 'doc_id') else None
+            
+            if doc_id_to_find:
+                # Find the original document to get metadata
+                for doc in self.vector_store.documents:
+                    try:
+                        if hasattr(doc, 'doc_id') and doc.doc_id == doc_id_to_find:
+                            if hasattr(doc, 'metadata') and doc.metadata and isinstance(doc.metadata, dict):
+                                chunk_type = doc.metadata.get('chunk_type', 'legacy')
+                            break
+                    except (AttributeError, TypeError):
+                        continue
+            
+            # Apply priority multiplier
+            multiplier = PRIORITY_MULTIPLIERS.get(chunk_type, 1.0)
+            result.combined_score *= multiplier
+        
+        # Sort by boosted combined score (descending)
         results.sort(key=lambda r: r.combined_score, reverse=True)
         
         # Assign ranks

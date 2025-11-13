@@ -54,7 +54,7 @@ DEFAULT_EMBEDDING_DIM = 384
 
 
 # ============================================================================
-# Temporal Spin Encoding
+# Temporal Spin Encoding (Point and Arc)
 # ============================================================================
 
 def compute_spin_vector(
@@ -62,55 +62,98 @@ def compute_spin_vector(
     t0_seconds: float = T0_SECONDS,
     period_seconds: float = PERIOD_SECONDS,
     phase_offset: float = 0.0,
-    temporal_scale: float = 1.0
-) -> Tuple[List[float], float]:
+    temporal_scale: float = 1.0,
+    end_timestamp_seconds: Optional[float] = None
+) -> Tuple[List[float], float, Optional[float], Optional[float]]:
     """
-    Map a timestamp to a unit-circle spin vector with optional scaling.
+    Map a timestamp (or time interval) to a temporal spin vector.
     
-    The timestamp is normalized to a fraction of the period, then converted
-    to an angle φ ∈ [0, 2π). This creates a continuous, periodic representation
-    of time as a 2D rotation.
+    Supports two modes (both return 3D vectors for consistent dimensionality):
+    1. Point mode: Single timestamp → 3D vector [cos(φ), sin(φ), 0.0]
+    2. Arc mode: Start and end timestamps → 3D vector [cos(φ_center), sin(φ_center), arc_length]
     
     Args:
-        timestamp_seconds: Unix timestamp in seconds
+        timestamp_seconds: Unix timestamp in seconds (start time for arcs)
         t0_seconds: Base epoch timestamp (default: 2010-01-01)
         period_seconds: Period length for full rotation (default: 1000 years)
         phase_offset: Optional phase shift in radians
         temporal_scale: Scaling factor for spin vector magnitude (default: 1.0)
-                       NOTE: Has no effect on cosine similarity (scale-invariant).
-                       Kept for API consistency. Use β in retrieval for temporal control.
+                       NOTE: Has no effect on cosine similarity (scale-invariant)
+        end_timestamp_seconds: Optional end timestamp for arc mode. If None, uses point mode.
     
     Returns:
-        (spin_vector, phi): Scaled 2D vector [scale*cos(φ), scale*sin(φ)] and angle φ
+        Tuple of (spin_vector, phi_center, phi_start, phi_end):
+        - spin_vector: Always 3D [cos(φ), sin(φ), arc_length]
+                      (arc_length=0 for points, >0 for arcs)
+        - phi_center: Center angle (equals phi for points)
+        - phi_start: Start angle (None for points, angle for arcs)
+        - phi_end: End angle (None for points, angle for arcs)
     
-    Example:
-        >>> t = datetime(2015, 1, 1, tzinfo=timezone.utc).timestamp()
-        >>> spin, phi = compute_spin_vector(t, temporal_scale=1.0)
-        >>> # Spin vector on unit circle (default)
+    Examples:
+        >>> # Point mode
+        >>> t = datetime(2023, 6, 15, tzinfo=timezone.utc).timestamp()
+        >>> spin, phi_c, phi_s, phi_e = compute_spin_vector(t)
+        >>> # Returns: 3D vector with arc_length=0, phi_s=phi_e=None
+        
+        >>> # Arc mode (Q2 2023)
+        >>> t_start = datetime(2023, 4, 1, tzinfo=timezone.utc).timestamp()
+        >>> t_end = datetime(2023, 6, 30, tzinfo=timezone.utc).timestamp()
+        >>> spin, phi_c, phi_s, phi_e = compute_spin_vector(t_start, end_timestamp_seconds=t_end)
+        >>> # Returns: 3D vector with arc_length in third component
     
     Note on Temporal Control:
-        Since cosine similarity is scale-invariant (only direction matters, not magnitude),
-        temporal_scale has NO effect on retrieval ranking. To control temporal influence:
-        - Use β parameter in re-ranking: exp(-β × (Δφ)²)
-        - Or extract year from query and boost exact matches
+        Use β parameter in retrieval for temporal zoom control, not temporal_scale.
+        Arc encoding allows hierarchical period matching (quarters ⊂ years).
     """
     if period_seconds <= 0:
         raise ValueError("period_seconds must be positive")
     
-    # Normalize time to [0, 1) fractional position within period
-    fraction = ((timestamp_seconds - t0_seconds) / period_seconds) % 1.0
+    # Point mode (default): Single timestamp
+    if end_timestamp_seconds is None:
+        # Normalize time to [0, 1) fractional position within period
+        fraction = ((timestamp_seconds - t0_seconds) / period_seconds) % 1.0
+        
+        # Convert to angle: φ ∈ [0, 2π)
+        phi = math.tau * fraction + phase_offset  # tau = 2π
+        
+        # Spin vector on unit circle (3D with arc_length=0 for points)
+        # This ensures consistent dimensionality with arc mode
+        cos_phi = math.cos(phi)
+        sin_phi = math.sin(phi)
+        spin_vector = [temporal_scale * cos_phi, temporal_scale * sin_phi, 0.0]
+        
+        return spin_vector, phi, None, None
     
-    # Convert to angle: φ ∈ [0, 2π)
-    phi = math.tau * fraction + phase_offset  # tau = 2π
-    
-    # Spin vector on unit circle
-    cos_phi = math.cos(phi)
-    sin_phi = math.sin(phi)
-    
-    # Apply temporal scaling
-    spin_vector = [temporal_scale * cos_phi, temporal_scale * sin_phi]
-    
-    return spin_vector, phi
+    # Arc mode: Start and end timestamps
+    else:
+        # Compute start and end angles
+        fraction_start = ((timestamp_seconds - t0_seconds) / period_seconds) % 1.0
+        fraction_end = ((end_timestamp_seconds - t0_seconds) / period_seconds) % 1.0
+        
+        phi_start = math.tau * fraction_start + phase_offset
+        phi_end = math.tau * fraction_end + phase_offset
+        
+        # Handle wrapping: if end < start, arc crosses 0°
+        if phi_end < phi_start:
+            phi_end += math.tau
+        
+        # Compute arc center and length
+        phi_center = (phi_start + phi_end) / 2.0
+        arc_length = phi_end - phi_start
+        
+        # Normalize phi_center back to [0, 2π)
+        phi_center = phi_center % math.tau
+        
+        # Spin vector for arcs (3D: center + arc_length)
+        cos_center = math.cos(phi_center)
+        sin_center = math.sin(phi_center)
+        spin_vector = [
+            temporal_scale * cos_center,
+            temporal_scale * sin_center,
+            arc_length  # Arc length in radians (not scaled)
+        ]
+        
+        return spin_vector, phi_center, phi_start, phi_end
 
 
 def angular_difference(phi1: float, phi2: float) -> float:
@@ -127,6 +170,88 @@ def angular_difference(phi1: float, phi2: float) -> float:
     """
     diff = abs(phi1 - phi2) % math.tau
     return min(diff, math.tau - diff)
+
+
+def arc_overlap(phi_start1: float, phi_end1: float, 
+                phi_start2: float, phi_end2: float) -> float:
+    """
+    Compute the overlap (intersection) between two arcs on the unit circle.
+    
+    Arcs are defined by [phi_start, phi_end]. This function handles wrapping.
+    
+    Args:
+        phi_start1, phi_end1: First arc (start and end angles in radians)
+        phi_start2, phi_end2: Second arc
+    
+    Returns:
+        Overlap length in radians [0, 2π]
+    
+    Example:
+        >>> # Two arcs covering Q1 and Q2 of a year
+        >>> q1_start, q1_end = 0.0, math.pi/2
+        >>> q2_start, q2_end = math.pi/2, math.pi
+        >>> overlap = arc_overlap(q1_start, q1_end, q2_start, q2_end)
+        >>> # Returns 0.0 (adjacent, no overlap)
+    """
+    # Normalize all angles to [0, 2π)
+    phi_start1 = phi_start1 % math.tau
+    phi_end1 = phi_end1 % math.tau
+    phi_start2 = phi_start2 % math.tau
+    phi_end2 = phi_end2 % math.tau
+    
+    # Handle wrapping for arc 1
+    if phi_end1 < phi_start1:
+        phi_end1 += math.tau
+    
+    # Handle wrapping for arc 2
+    if phi_end2 < phi_start2:
+        phi_end2 += math.tau
+    
+    # Find intersection
+    intersection_start = max(phi_start1, phi_start2)
+    intersection_end = min(phi_end1, phi_end2)
+    
+    if intersection_end > intersection_start:
+        return intersection_end - intersection_start
+    else:
+        return 0.0
+
+
+def jaccard_similarity_arcs(phi_start1: float, phi_end1: float,
+                            phi_start2: float, phi_end2: float) -> float:
+    """
+    Compute Jaccard similarity between two arcs on the unit circle.
+    
+    Jaccard = |intersection| / |union|
+    
+    Args:
+        phi_start1, phi_end1: First arc
+        phi_start2, phi_end2: Second arc
+    
+    Returns:
+        Jaccard similarity in [0, 1]
+    
+    Example:
+        >>> # Annual report (full year) vs Q2 (quarter)
+        >>> year_start, year_end = 0.0, 2*math.pi
+        >>> q2_start, q2_end = math.pi/2, math.pi
+        >>> sim = jaccard_similarity_arcs(year_start, year_end, q2_start, q2_end)
+        >>> # Returns 0.25 (quarter is 25% of year)
+    """
+    # Compute arc lengths
+    arc1_length = (phi_end1 - phi_start1) % math.tau
+    arc2_length = (phi_end2 - phi_start2) % math.tau
+    
+    # Compute intersection
+    intersection = arc_overlap(phi_start1, phi_end1, phi_start2, phi_end2)
+    
+    # Compute union
+    union = arc1_length + arc2_length - intersection
+    
+    if union == 0:
+        return 0.0
+    
+    return intersection / union
 
 
 # ============================================================================
@@ -206,16 +331,22 @@ def extract_timestamp_from_text(
 @dataclass
 class SpinDocument:
     """
-    A document with temporal-phase spin encoding.
+    A document with temporal-phase spin encoding (point or arc mode).
     
     Attributes:
         doc_id: Unique identifier
         text: Original document text
-        timestamp: Document timestamp (UTC)
+        timestamp: Document timestamp (UTC) - start time for arcs
         semantic_embedding: Semantic embedding vector from model
-        spin_vector: 2D temporal spin vector [cos(φ), sin(φ)]
-        phi: Phase angle in radians
+        spin_vector: Always 3D [cos(φ), sin(φ), arc_length]
+                    - arc_length=0 for points (instant)
+                    - arc_length>0 for arcs (time period)
+        phi: Phase angle in radians (center angle for arcs)
         full_embedding: Concatenated [semantic_embedding + spin_vector]
+        end_timestamp: Optional end timestamp for arc mode (None for points)
+        phi_start: Start angle for arcs (None for points)
+        phi_end: End angle for arcs (None for points)
+        is_arc: True if this is an arc (time period), False if point (instant)
     """
     doc_id: str
     text: str
@@ -225,25 +356,36 @@ class SpinDocument:
     phi: float
     full_embedding: List[float]
     metadata: Dict[str, Any] = None
+    end_timestamp: Optional[datetime] = None
+    phi_start: Optional[float] = None
+    phi_end: Optional[float] = None
+    is_arc: bool = False
     
     def __post_init__(self):
         if self.metadata is None:
             self.metadata = {}
+        # Auto-detect arc mode
+        if self.end_timestamp is not None:
+            self.is_arc = True
 
 
 @dataclass
 class SpinQuery:
     """
-    A query with temporal-phase spin encoding.
+    A query with temporal-phase spin encoding (point or arc mode).
     
     Attributes:
         query_text: Query string
-        query_timestamp: Target timestamp for retrieval
+        query_timestamp: Target timestamp for retrieval (start for arcs)
         semantic_embedding: Semantic query embedding
-        spin_vector: 2D temporal spin vector
-        phi: Phase angle in radians
+        spin_vector: Always 3D [cos(φ), sin(φ), arc_length]
+        phi: Phase angle in radians (center for arcs)
         lambda_factor: Weight for spin component (default: 1.0)
         full_embedding: Concatenated query vector
+        end_timestamp: Optional end timestamp for arc queries
+        phi_start: Start angle for arc queries
+        phi_end: End angle for arc queries
+        is_arc: True if querying a time period
     """
     query_text: str
     query_timestamp: datetime
@@ -252,6 +394,10 @@ class SpinQuery:
     phi: float
     lambda_factor: float = 1.0
     full_embedding: List[float] = None
+    end_timestamp: Optional[datetime] = None
+    phi_start: Optional[float] = None
+    phi_end: Optional[float] = None
+    is_arc: bool = False
     
     def __post_init__(self):
         if self.full_embedding is None:
@@ -275,6 +421,11 @@ class RetrievalResult:
     temporal_alignment: float  # exp(-β × (Δφ)²)
     combined_score: float
     rank: int = 0
+    metadata: Dict[str, Any] = None
+    
+    def __post_init__(self):
+        if self.metadata is None:
+            self.metadata = {}
 
 
 # ============================================================================

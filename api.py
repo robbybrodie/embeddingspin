@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse
 
 from temporal_spin import T0_SECONDS, PERIOD_SECONDS
 from llamastack_client import LlamaStackEmbeddingClient, MockEmbeddingClient
+from openai_client import OpenAIEmbeddingClient
 from vector_store import InMemoryVectorStore, ChromaVectorStore, VectorStore
 from ingestion import TemporalSpinIngestionPipeline
 from retrieval import TemporalSpinRetriever
@@ -134,13 +135,19 @@ async def startup_event():
     """Initialize system on startup."""
     global vector_store, embedding_client, ingestion_pipeline, retriever
     
-    # Determine whether to use mock embeddings
-    use_mock = os.getenv("USE_MOCK_EMBEDDINGS", "true").lower() == "true"
+    # Determine which embedding client to use
+    use_openai = os.getenv("USE_OPENAI_EMBEDDINGS", "true").lower() == "true"  # DEFAULT TO OPENAI
+    use_mock = os.getenv("USE_MOCK_EMBEDDINGS", "false").lower() == "true"  # NO MOCK BY DEFAULT
     
     # Initialize embedding client
-    if use_mock:
+    if use_openai:
+        # Use OpenAI's best embedding model
+        model_name = os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")
+        embedding_client = OpenAIEmbeddingClient(model=model_name)
+        print(f"✓ Using OpenAI Embeddings: {model_name} ({embedding_client.dimension}-dim)")
+    elif use_mock:
         embedding_client = MockEmbeddingClient(dimension=384)
-        print("✓ Using MockEmbeddingClient (set USE_MOCK_EMBEDDINGS=false for LlamaStack)")
+        print("✓ Using MockEmbeddingClient (set USE_OPENAI_EMBEDDINGS=true for OpenAI)")
     else:
         llamastack_url = os.getenv("LLAMASTACK_URL", "http://localhost:8000")
         model_name = os.getenv("EMBEDDING_MODEL", "text-embedding-v1")

@@ -1,6 +1,22 @@
 # Temporal-Phase Spin Retrieval System
 
-A novel retrieval algorithm that encodes time as an angular spin state on the unit circle, enabling smooth temporal zoom without model retraining.
+**A novel retrieval algorithm that encodes time as an angular spin state on the unit circle, enabling smooth temporal zoom without model retraining.**
+
+---
+
+## 📌 What Problem Does This Solve?
+
+Traditional vector databases fail at **time-series retrieval** for semantically similar documents from different time periods:
+
+- **The Problem**: "IBM Q2 2023 revenue" and "IBM Q2 2024 revenue" have nearly identical semantic embeddings, making it hard to retrieve the correct temporal document.
+- **Traditional Solutions**: Metadata filters (brittle), timestamp features (discrete), or fine-tuning (expensive).
+- **Our Solution**: Encode time as a **continuous geometric phase** on the unit circle, enabling:
+  - 🎯 **Smooth temporal zoom** (from broad to exact via β parameter)
+  - 🔄 **Hierarchical time matching** (points within arcs, arc-to-arc overlap)
+  - 🚫 **No model retraining** (post-hoc geometric augmentation)
+  - ⚡ **Efficient retrieval** (two-pass search with arc-aware scoring)
+
+**Combined with time-aware chunking strategies, this provides a simple and elegant fix for temporal retrieval in vector databases.**
 
 ## 🎯 Core Concept
 
@@ -23,6 +39,48 @@ The semantic embedding model is **frozen**. Time encoding happens post-hoc in th
 - ✅ Interpretable (phase angles have clear geometric meaning)
 - ✅ Controllable (β parameter adjusts temporal focus at runtime)
 
+### 🆕 Arc-Based Temporal Encoding (Time Periods)
+
+**NEW**: The system now supports **both point and arc encoding**:
+
+#### Point Mode
+- Single timestamp → 3D spin vector `[cos(φ), sin(φ), 0.0]`
+- For point-in-time events (news articles, tweets, instant messages)
+- `arc_length = 0` for backward compatibility and consistent dimensionality
+
+#### Arc Mode
+- Time interval `[t_start, t_end]` → 3D spin vector `[cos(φ_center), sin(φ_center), arc_length]`
+- For time periods (quarterly reports, annual reviews, multi-day events)
+- `arc_length > 0` encodes the temporal extent of the period
+
+**Visual Example (100-year circle):**
+
+```
+Point encoding:      Annual report:        Quarterly report:
+     •               ────────────           ───
+   2023.5            2023 (full year)       Q2 2023
+
+Arc overlap detection:
+- Quarterly ⊂ Annual: Jaccard = 0.25 (quarter is 25% of year)
+- Adjacent quarters: Jaccard = 0.0 (no overlap)
+- Point within arc: Temporal alignment = 1.0
+```
+
+**Arc-Aware Retrieval:**
+
+| Query Type | Document Type | Matching Logic |
+|------------|---------------|----------------|
+| Point → Point | Point → Point | Angular distance (legacy) |
+| Point → Arc | Query falls within doc period? | 1.0 if inside, else distance to center |
+| Arc → Point | Doc falls within query period? | 1.0 if inside, else distance to center |
+| Arc → Arc | Temporal overlap | Jaccard similarity |
+
+**Use Cases:**
+- **Financial reporting hierarchy**: 10-Q (quarterly) ⊂ 10-K (annual)
+- **Event periods**: "Q2 2023 performance" retrieves docs from Apr-Jun 2023
+- **Time-series chunking**: Each chunk knows its temporal extent
+- **Periodic data**: Automatically handle wrapping (e.g., fiscal years)
+
 ## 🔬 How It Works
 
 ### Ingestion Pipeline
@@ -35,16 +93,29 @@ The semantic embedding model is **frozen**. Time encoding happens post-hoc in th
    - Uses registered embedding models (e.g., `text-embedding-v1`)
    - No special temporal training needed
 
-3. **Spin Encoding**: Convert timestamp to 2D spin vector
+3. **Spin Encoding**: Convert timestamp(s) to spin vector
+   
+   **Point mode (single timestamp):**
    ```python
    fraction = ((timestamp - t₀) / period) % 1.0
    φ = 2π × fraction
-   spin = [cos(φ), sin(φ)]
+   spin = [cos(φ), sin(φ), 0.0]  # 3D with arc_length=0
+   ```
+   
+   **Arc mode (time interval):**
+   ```python
+   φ_start = 2π × ((t_start - t₀) / period) % 1.0
+   φ_end = 2π × ((t_end - t₀) / period) % 1.0
+   φ_center = (φ_start + φ_end) / 2
+   arc_length = φ_end - φ_start
+   spin = [cos(φ_center), sin(φ_center), arc_length]  # 3D with arc_length>0
    ```
 
 4. **Concatenation**: Combine semantic + spin into full embedding
    ```python
-   full_embedding = [semantic_embedding..., spin_vector[0], spin_vector[1]]
+   # Both points and arcs use 3D spin vectors for consistent dimensionality
+   full_embedding = [semantic_embedding..., spin[0], spin[1], spin[2]]
+   # Points have spin[2]=0, arcs have spin[2]=arc_length
    ```
 
 5. **Storage**: Index in vector database (PGVector, Chroma, or in-memory)
@@ -60,12 +131,23 @@ candidates = vector_db.search(query_full, top_k=50)
 
 Uses small λ to perform broad semantic search with minor temporal weighting.
 
-#### Pass 2: Temporal Zoom Re-ranking
+#### Pass 2: Temporal Zoom Re-ranking (Arc-Aware)
 
 ```python
 for doc in candidates:
-    Δφ = angular_difference(φ_query, φ_doc)  # Shortest arc on circle
-    temporal_alignment = exp(-β × (Δφ)²)
+    # Point-to-point (legacy)
+    if not query.is_arc and not doc.is_arc:
+        Δφ = angular_difference(φ_query, φ_doc)
+        temporal_alignment = exp(-β × (Δφ)²)
+    
+    # Arc-to-arc (new)
+    elif query.is_arc and doc.is_arc:
+        temporal_alignment = jaccard_similarity(query_arc, doc_arc)
+    
+    # Point-within-arc or arc-contains-point
+    else:
+        temporal_alignment = 1.0 if overlap > 0 else exp(-β × (Δφ_center)²)
+    
     score = semantic_similarity × temporal_alignment
 ```
 
@@ -130,6 +212,71 @@ curl -X POST "http://localhost:8080/temporal_search" \
     "beta": 5.0,
     "top_k": 10
   }'
+```
+
+### Arc Encoding Usage Example
+
+**Ingesting time periods (quarterly/annual reports):**
+
+```python
+from datetime import datetime
+from ingestion import TemporalSpinIngestionPipeline
+from openai_client import OpenAIEmbeddingClient
+from vector_store import InMemoryVectorStore
+
+# Initialize
+client = OpenAIEmbeddingClient(api_key="your-key")
+store = InMemoryVectorStore()
+pipeline = TemporalSpinIngestionPipeline(client, store)
+
+# Ingest annual report (arc mode)
+pipeline.ingest_document(
+    text="IBM's fiscal year 2023 saw record AI growth...",
+    timestamp=datetime(2023, 1, 1),
+    end_timestamp=datetime(2023, 12, 31),  # Full year arc
+    metadata={"type": "10-K", "year": 2023}
+)
+
+# Ingest quarterly report (arc mode)
+pipeline.ingest_document(
+    text="Q2 2023 performance exceeded expectations...",
+    timestamp=datetime(2023, 4, 1),
+    end_timestamp=datetime(2023, 6, 30),  # Q2 arc
+    metadata={"type": "10-Q", "quarter": "Q2", "year": 2023}
+)
+
+# Ingest point-in-time event (point mode)
+pipeline.ingest_document(
+    text="IBM announced major acquisition on March 15, 2023...",
+    timestamp=datetime(2023, 3, 15),
+    # No end_timestamp = point mode
+    metadata={"type": "news"}
+)
+```
+
+**Querying with arc matching:**
+
+```python
+from retrieval import TemporalSpinRetriever
+
+retriever = TemporalSpinRetriever(client, store, default_beta=5000.0)
+
+# Query for a specific quarter (arc query)
+results = retriever.search(
+    query_text="Q2 2023 revenue growth",
+    query_timestamp=datetime(2023, 4, 1),
+    end_timestamp=datetime(2023, 6, 30),  # Arc query
+    beta=5000.0
+)
+# Returns: Both Q2 report (exact match) and annual report (contains Q2)
+
+# Query for a point in time
+results = retriever.search(
+    query_text="March 2023 acquisition",
+    query_timestamp=datetime(2023, 3, 15),  # Point query
+    beta=5000.0
+)
+# Returns: News article (exact), Q1 report (contains March), annual (contains March)
 ```
 
 ### Production Setup (LlamaStack + PGVector)
@@ -450,6 +597,7 @@ For questions or collaboration: robbytherobot@redhat.com
 - Red Hat AI 3 (LlamaStack) team for Model Gateway API
 - PGVector and Chroma DB for vector search capabilities
 - Community contributors to dateutil, FastAPI, and related libraries
+- **Arc-based temporal encoding** extension developed in collaboration to solve hierarchical time-period matching for financial reporting (10-Q/10-K) and time-series chunking strategies
 
 ---
 

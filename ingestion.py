@@ -74,19 +74,25 @@ class TemporalSpinIngestionPipeline:
         text: str,
         timestamp: Optional[datetime] = None,
         doc_id: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        end_timestamp: Optional[datetime] = None
     ) -> SpinDocument:
         """
-        Ingest a single document.
+        Ingest a single document with point or arc temporal encoding.
         
         Args:
             text: Document text
-            timestamp: Optional explicit timestamp (if None, will be extracted)
+            timestamp: Start timestamp (if None, will be extracted)
             doc_id: Optional document ID (if None, will be generated)
             metadata: Optional metadata dictionary
+            end_timestamp: Optional end timestamp for arc mode (time period)
         
         Returns:
-            SpinDocument with embeddings and spin encoding
+            SpinDocument with embeddings and spin encoding (point or arc)
+        
+        Note:
+            - If end_timestamp is None: Point mode (instant in time)
+            - If end_timestamp is provided: Arc mode (time period/interval)
         """
         # Generate ID if not provided
         if doc_id is None:
@@ -106,17 +112,20 @@ class TemporalSpinIngestionPipeline:
         # Get semantic embedding from LlamaStack
         semantic_embedding = self.embedding_client.embed_single(text)
         
-        # Compute temporal spin vector with scaling
+        # Compute temporal spin vector (point or arc mode)
         timestamp_seconds = timestamp.timestamp()
-        spin_vector, phi = compute_spin_vector(
+        end_seconds = end_timestamp.timestamp() if end_timestamp else None
+        
+        spin_vector, phi_center, phi_start, phi_end = compute_spin_vector(
             timestamp_seconds,
             self.t0_seconds,
             self.period_seconds,
-            temporal_scale=self.temporal_scale
+            temporal_scale=self.temporal_scale,
+            end_timestamp_seconds=end_seconds
         )
         
-        # Concatenate: full_embedding = [semantic_embedding, scaled_spin_vector]
-        # The spin vector is already scaled by temporal_scale inside compute_spin_vector
+        # Concatenate: full_embedding = [semantic_embedding, spin_vector]
+        # spin_vector is 2D for points, 3D for arcs
         full_embedding = semantic_embedding + spin_vector
         
         # Create SpinDocument
@@ -126,9 +135,13 @@ class TemporalSpinIngestionPipeline:
             timestamp=timestamp,
             semantic_embedding=semantic_embedding,
             spin_vector=spin_vector,
-            phi=phi,
+            phi=phi_center,
             full_embedding=full_embedding,
-            metadata=metadata or {}
+            metadata=metadata or {},
+            end_timestamp=end_timestamp,
+            phi_start=phi_start,
+            phi_end=phi_end,
+            is_arc=(end_timestamp is not None)
         )
         
         # Store in vector database
@@ -141,16 +154,18 @@ class TemporalSpinIngestionPipeline:
         texts: List[str],
         timestamps: Optional[List[datetime]] = None,
         doc_ids: Optional[List[str]] = None,
-        metadatas: Optional[List[Dict[str, Any]]] = None
+        metadatas: Optional[List[Dict[str, Any]]] = None,
+        end_timestamps: Optional[List[Optional[datetime]]] = None
     ) -> List[SpinDocument]:
         """
         Ingest multiple documents in a batch (more efficient).
         
         Args:
             texts: List of document texts
-            timestamps: Optional list of timestamps (None = auto-extract)
+            timestamps: Optional list of start timestamps (None = auto-extract)
             doc_ids: Optional list of document IDs
             metadatas: Optional list of metadata dicts
+            end_timestamps: Optional list of end timestamps for arc mode (None = point mode)
         
         Returns:
             List of SpinDocument objects
@@ -164,6 +179,8 @@ class TemporalSpinIngestionPipeline:
             doc_ids = [str(uuid.uuid4()) for _ in range(n)]
         if metadatas is None:
             metadatas = [{}] * n
+        if end_timestamps is None:
+            end_timestamps = [None] * n
         
         # Extract timestamps where needed
         resolved_timestamps = []
@@ -183,16 +200,19 @@ class TemporalSpinIngestionPipeline:
         # Create SpinDocument objects
         documents = []
         for i in range(n):
-            # Compute spin vector with scaling
+            # Compute spin vector (point or arc mode)
             timestamp_seconds = resolved_timestamps[i].timestamp()
-            spin_vector, phi = compute_spin_vector(
+            end_seconds = end_timestamps[i].timestamp() if end_timestamps[i] else None
+            
+            spin_vector, phi_center, phi_start, phi_end = compute_spin_vector(
                 timestamp_seconds,
                 self.t0_seconds,
                 self.period_seconds,
-                temporal_scale=self.temporal_scale
+                temporal_scale=self.temporal_scale,
+                end_timestamp_seconds=end_seconds
             )
             
-            # Concatenate (spin vector is already scaled)
+            # Concatenate (spin vector is 2D for points, 3D for arcs)
             full_embedding = semantic_embeddings[i] + spin_vector
             
             # Create document
@@ -202,9 +222,13 @@ class TemporalSpinIngestionPipeline:
                 timestamp=resolved_timestamps[i],
                 semantic_embedding=semantic_embeddings[i],
                 spin_vector=spin_vector,
-                phi=phi,
+                phi=phi_center,
                 full_embedding=full_embedding,
-                metadata=metadatas[i]
+                metadata=metadatas[i],
+                end_timestamp=end_timestamps[i],
+                phi_start=phi_start,
+                phi_end=phi_end,
+                is_arc=(end_timestamps[i] is not None)
             )
             documents.append(doc)
         
