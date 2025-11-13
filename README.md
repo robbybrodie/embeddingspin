@@ -597,7 +597,7 @@ For questions or collaboration: robbytherobot@redhat.com
 - Red Hat AI 3 (LlamaStack) team for Model Gateway API
 - PGVector and Chroma DB for vector search capabilities
 - Community contributors to dateutil, FastAPI, and related libraries
-- **Arc-based temporal encoding** extension developed in collaboration to solve hierarchical time-period matching for financial reporting (10-Q/10-K) and time-series chunking strategies
+- **Bryon Baker** (brbaker@redhat.com) for collaborative development of the arc-based temporal encoding extension, solving hierarchical time-period matching for financial reporting (10-Q/10-K) and time-series chunking strategies
 
 ---
 
