@@ -177,18 +177,14 @@ class ChromaVectorStore(VectorStore):
         """
         try:
             import chromadb
-            from chromadb.config import Settings
         except ImportError:
             raise ImportError(
                 "chromadb not installed. Install with: pip install chromadb"
             )
         
-        # Create Chroma client
+        # Create Chroma client (ChromaDB 1.3+ API)
         if persist_directory:
-            self.client = chromadb.Client(Settings(
-                chroma_db_impl="duckdb+parquet",
-                persist_directory=persist_directory
-            ))
+            self.client = chromadb.PersistentClient(path=persist_directory)
         else:
             self.client = chromadb.Client()
         
@@ -213,9 +209,22 @@ class ChromaVectorStore(VectorStore):
         for doc in documents:
             metadata = {
                 "timestamp": doc.timestamp.isoformat(),
-                "phi": doc.phi,
+                "phi": json.dumps(doc.phi),  # Serialize dict to JSON string
                 "spin_vector": json.dumps(doc.spin_vector),
+                # NEW: Store arc encoding metadata
+                "is_arc": doc.is_arc,
             }
+            
+            # Add end_timestamp for arc-encoded documents
+            if doc.end_timestamp:
+                metadata["end_timestamp"] = doc.end_timestamp.isoformat()
+            
+            # Add phi_start and phi_end for arc-encoded documents
+            if doc.phi_start:
+                metadata["phi_start"] = json.dumps(doc.phi_start)
+            if doc.phi_end:
+                metadata["phi_end"] = json.dumps(doc.phi_end)
+            
             if doc.metadata:
                 # Add custom metadata (ensure JSON-serializable)
                 for k, v in doc.metadata.items():
@@ -254,34 +263,78 @@ class ChromaVectorStore(VectorStore):
         results = self.collection.query(
             query_embeddings=[query_embedding],
             n_results=top_k,
-            where=filter_dict
+            where=filter_dict,
+            include=["documents", "metadatas", "distances", "embeddings"]
         )
         
         # Parse results
         documents = []
-        if results["ids"] and results["ids"][0]:
+        if results["ids"] and len(results["ids"]) > 0 and len(results["ids"][0]) > 0:
             for i, doc_id in enumerate(results["ids"][0]):
                 text = results["documents"][0][i]
                 metadata = results["metadatas"][0][i]
                 distance = results["distances"][0][i] if "distances" in results else 0
                 
+                # Get embedding and convert to list if numpy array
+                embedding = None
+                if "embeddings" in results and len(results["embeddings"]) > 0 and len(results["embeddings"][0]) > i:
+                    emb = results["embeddings"][0][i]
+                    # Handle numpy arrays
+                    if hasattr(emb, 'tolist'):
+                        embedding = emb.tolist()
+                    else:
+                        embedding = list(emb) if emb is not None else []
+                
                 # Reconstruct SpinDocument
                 timestamp = datetime.fromisoformat(metadata["timestamp"])
-                phi = metadata["phi"]
+                phi = json.loads(metadata["phi"])  # Deserialize JSON string to dict
                 spin_vector = json.loads(metadata["spin_vector"])
                 
-                # Note: We don't have the original semantic embedding here,
-                # but for retrieval we only need these fields
+                # NEW: Deserialize arc encoding metadata
+                is_arc = metadata.get("is_arc", False)
+                end_timestamp = None
+                phi_start = None
+                phi_end = None
+                
+                if is_arc:
+                    end_ts_str = metadata.get("end_timestamp")
+                    if end_ts_str:
+                        end_timestamp = datetime.fromisoformat(end_ts_str)
+                    
+                    phi_start_str = metadata.get("phi_start")
+                    if phi_start_str:
+                        phi_start = json.loads(phi_start_str)
+                    
+                    phi_end_str = metadata.get("phi_end")
+                    if phi_end_str:
+                        phi_end = json.loads(phi_end_str)
+                
+                # Extract semantic embedding from full embedding
+                # full_embedding = [semantic (N dims), temporal_9d (9 dims)]
+                # temporal_9d = [x_q, y_q, z_q, x_d, y_d, z_d, x_c, y_c, z_c]
+                if embedding and len(embedding) > 9:
+                    semantic_embedding = embedding[:-9]  # All but last 9 dims
+                    full_embedding = embedding
+                else:
+                    # Fallback: no embeddings returned, leave empty
+                    semantic_embedding = []
+                    full_embedding = []
+                
                 doc = SpinDocument(
                     doc_id=doc_id,
                     text=text,
                     timestamp=timestamp,
-                    semantic_embedding=[],  # Not stored separately
+                    semantic_embedding=semantic_embedding,
                     spin_vector=spin_vector,
                     phi=phi,
-                    full_embedding=[],  # Can retrieve if needed
+                    full_embedding=full_embedding,
                     metadata={k: v for k, v in metadata.items() 
-                             if k not in ["timestamp", "phi", "spin_vector"]}
+                             if k not in ["timestamp", "phi", "spin_vector", "is_arc", 
+                                          "end_timestamp", "phi_start", "phi_end"]},
+                    end_timestamp=end_timestamp,
+                    phi_start=phi_start,
+                    phi_end=phi_end,
+                    is_arc=is_arc
                 )
                 
                 # Convert distance to similarity (Chroma returns L2 distance)

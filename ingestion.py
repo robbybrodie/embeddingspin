@@ -22,7 +22,9 @@ from temporal_spin import (
     compute_spin_vector,
     extract_timestamp_from_text,
     T0_SECONDS,
-    PERIOD_SECONDS
+    QUARTER_SCALE_YEARS,
+    DECADE_SCALE_YEARS,
+    CENTURY_SCALE_YEARS
 )
 from llamastack_client import LlamaStackEmbeddingClient, MockEmbeddingClient
 from vector_store import VectorStore
@@ -48,7 +50,7 @@ class TemporalSpinIngestionPipeline:
         embedding_client: LlamaStackEmbeddingClient,
         vector_store: VectorStore,
         t0_seconds: float = T0_SECONDS,
-        period_seconds: float = PERIOD_SECONDS,
+        period_seconds: float = None,  # Deprecated - multi-scale now
         temporal_scale: float = 1.0
     ):
         """
@@ -58,7 +60,7 @@ class TemporalSpinIngestionPipeline:
             embedding_client: Client for obtaining semantic embeddings
             vector_store: Vector database for storage
             t0_seconds: Base epoch for timestamp normalization
-            period_seconds: Period for spin encoding (default: 1000 years)
+            period_seconds: Deprecated (multi-scale encoding used internally)
             temporal_scale: Scaling factor for spin vector (default: 1.0)
                            Note: Has no effect on cosine similarity (scale-invariant).
                            Use β parameter in retrieval for temporal control instead.
@@ -66,7 +68,7 @@ class TemporalSpinIngestionPipeline:
         self.embedding_client = embedding_client
         self.vector_store = vector_store
         self.t0_seconds = t0_seconds
-        self.period_seconds = period_seconds
+        # period_seconds is deprecated - multi-scale encoding now used
         self.temporal_scale = temporal_scale
     
     def ingest_document(
@@ -116,16 +118,16 @@ class TemporalSpinIngestionPipeline:
         timestamp_seconds = timestamp.timestamp()
         end_seconds = end_timestamp.timestamp() if end_timestamp else None
         
-        spin_vector, phi_center, phi_start, phi_end = compute_spin_vector(
+        spin_vector, phi_centers, phi_starts, phi_ends = compute_spin_vector(
             timestamp_seconds,
             self.t0_seconds,
-            self.period_seconds,
+            period_seconds=None,  # Deprecated - multi-scale encoding
             temporal_scale=self.temporal_scale,
             end_timestamp_seconds=end_seconds
         )
         
         # Concatenate: full_embedding = [semantic_embedding, spin_vector]
-        # spin_vector is 2D for points, 3D for arcs
+        # spin_vector is now 9D (3 scales × 3D each)
         full_embedding = semantic_embedding + spin_vector
         
         # Create SpinDocument
@@ -135,12 +137,12 @@ class TemporalSpinIngestionPipeline:
             timestamp=timestamp,
             semantic_embedding=semantic_embedding,
             spin_vector=spin_vector,
-            phi=phi_center,
+            phi=phi_centers,  # Now a dict with keys 'quarter', 'decade', 'century'
             full_embedding=full_embedding,
             metadata=metadata or {},
             end_timestamp=end_timestamp,
-            phi_start=phi_start,
-            phi_end=phi_end,
+            phi_start=phi_starts,  # Now a dict
+            phi_end=phi_ends,  # Now a dict
             is_arc=(end_timestamp is not None)
         )
         
@@ -204,15 +206,15 @@ class TemporalSpinIngestionPipeline:
             timestamp_seconds = resolved_timestamps[i].timestamp()
             end_seconds = end_timestamps[i].timestamp() if end_timestamps[i] else None
             
-            spin_vector, phi_center, phi_start, phi_end = compute_spin_vector(
+            spin_vector, phi_centers, phi_starts, phi_ends = compute_spin_vector(
                 timestamp_seconds,
                 self.t0_seconds,
-                self.period_seconds,
+                period_seconds=None,  # Deprecated - multi-scale encoding
                 temporal_scale=self.temporal_scale,
                 end_timestamp_seconds=end_seconds
             )
             
-            # Concatenate (spin vector is 2D for points, 3D for arcs)
+            # Concatenate (spin vector is now 9D for multi-scale)
             full_embedding = semantic_embeddings[i] + spin_vector
             
             # Create document
@@ -222,12 +224,12 @@ class TemporalSpinIngestionPipeline:
                 timestamp=resolved_timestamps[i],
                 semantic_embedding=semantic_embeddings[i],
                 spin_vector=spin_vector,
-                phi=phi_center,
+                phi=phi_centers,  # Dict with keys 'quarter', 'decade', 'century'
                 full_embedding=full_embedding,
                 metadata=metadatas[i],
                 end_timestamp=end_timestamps[i],
-                phi_start=phi_start,
-                phi_end=phi_end,
+                phi_start=phi_starts,  # Dict
+                phi_end=phi_ends,  # Dict
                 is_arc=(end_timestamps[i] is not None)
             )
             documents.append(doc)

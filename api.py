@@ -20,8 +20,20 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import JSONResponse
+from dotenv import load_dotenv
 
-from temporal_spin import T0_SECONDS, PERIOD_SECONDS
+# Load environment variables from .env file
+load_dotenv()
+
+from temporal_spin import (
+    T0_SECONDS,
+    QUARTER_SCALE_YEARS,
+    DECADE_SCALE_YEARS,
+    CENTURY_SCALE_YEARS,
+    QUARTER_WEIGHT,
+    DECADE_WEIGHT,
+    CENTURY_WEIGHT
+)
 from llamastack_client import LlamaStackEmbeddingClient, MockEmbeddingClient
 from openai_client import OpenAIEmbeddingClient
 from vector_store import InMemoryVectorStore, ChromaVectorStore, VectorStore
@@ -37,7 +49,8 @@ from demo_data import generate_ibm_reports
 class Document(BaseModel):
     """Document for ingestion."""
     text: str = Field(..., description="Document text content")
-    timestamp: Optional[str] = Field(None, description="ISO format timestamp (optional)")
+    timestamp: Optional[str] = Field(None, description="ISO format timestamp (optional, start for arcs)")
+    end_timestamp: Optional[str] = Field(None, description="ISO format end timestamp for arc encoding (optional)")
     doc_id: Optional[str] = Field(None, description="Document ID (optional)")
     metadata: Optional[dict] = Field(None, description="Additional metadata (optional)")
 
@@ -45,11 +58,26 @@ class Document(BaseModel):
 class TemporalSearchRequest(BaseModel):
     """Request for temporal spin search."""
     query: str = Field(..., description="Search query text", example="IBM revenue 2016")
+    
+    # Arc-based query (preferred for period matching)
+    query_start_timestamp: Optional[str] = Field(
+        None,
+        description="ISO format arc start timestamp for period queries",
+        example="2016-01-01T00:00:00Z"
+    )
+    query_end_timestamp: Optional[str] = Field(
+        None,
+        description="ISO format arc end timestamp for period queries",
+        example="2016-03-31T23:59:59Z"
+    )
+    
+    # Point-based query (fallback)
     query_timestamp: Optional[str] = Field(
         None,
         description="ISO format query timestamp (default: now)",
         example="2016-06-30T00:00:00Z"
     )
+    
     beta: float = Field(
         5000.0,
         description="Temporal zoom factor (0=pure semantic, 100=weak, 1000=moderate, 5000=strong [default], 10000+=extreme)",
@@ -62,6 +90,13 @@ class TemporalSearchRequest(BaseModel):
         description="Number of results to return",
         ge=1,
         le=100
+    )
+    
+    # NEW: Concept filtering for precision retrieval
+    concept_filter: Optional[List[str]] = Field(
+        None,
+        description="Optional list of XBRL concepts to filter retrieval (e.g., ['NetIncomeLoss', 'Revenues'])",
+        example=["NetIncomeLoss", "IncomeLossFromContinuingOperations"]
     )
 
 
@@ -77,6 +112,7 @@ class TemporalSearchResult(BaseModel):
     phi_doc: float
     phi_query: float
     phi_difference_deg: float
+    metadata: dict = {}  # Include metadata for agent orchestration
 
 
 class TemporalSearchResponse(BaseModel):
@@ -105,7 +141,9 @@ class StatsResponse(BaseModel):
     embedding_model: str
     vector_store_type: str
     t0_epoch: str
-    period_years: float
+    temporal_encoding: str = "multi-scale"
+    period_years: List[float]  # [quarter, decade, century]
+    period_weights: List[float]  # [quarter_weight, decade_weight, century_weight]
 
 
 # ============================================================================
@@ -220,13 +258,84 @@ async def get_stats():
     if vector_store is None:
         raise HTTPException(status_code=503, detail="System not initialized")
     
+    # Determine correct embedding model name
+    if hasattr(embedding_client, 'model'):
+        # OpenAI client
+        model_name = embedding_client.model
+    elif hasattr(embedding_client, 'model_name'):
+        # LlamaStack client
+        model_name = embedding_client.model_name
+    else:
+        # MockEmbeddingClient or unknown
+        model_name = type(embedding_client).__name__
+    
     return StatsResponse(
         total_documents=vector_store.count(),
-        embedding_model=getattr(embedding_client, 'model_name', 'mock-embed'),
+        embedding_model=model_name,
         vector_store_type=type(vector_store).__name__,
         t0_epoch=datetime.fromtimestamp(T0_SECONDS).isoformat(),
-        period_years=PERIOD_SECONDS / (365.25 * 24 * 3600)
+        temporal_encoding="multi-scale (1/16/256 years)",
+        period_years=[QUARTER_SCALE_YEARS, DECADE_SCALE_YEARS, CENTURY_SCALE_YEARS],
+        period_weights=[QUARTER_WEIGHT, DECADE_WEIGHT, CENTURY_WEIGHT]
     )
+
+
+@app.post("/clear")
+async def clear_database():
+    """
+    Clear all documents from the vector store.
+    
+    This endpoint recreates the vector store, effectively removing all documents.
+    Useful before starting a fresh ingestion.
+    """
+    global vector_store, ingestion_pipeline, retriever
+    
+    if vector_store is None or embedding_client is None:
+        raise HTTPException(status_code=503, detail="System not initialized")
+    
+    try:
+        # Get current config
+        persist_dir = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
+        dimension = embedding_client.dimension
+        use_chroma = os.getenv("USE_CHROMA", "true").lower() == "true"
+        
+        # Recreate vector store (this clears ChromaDB)
+        if use_chroma:
+            vector_store = ChromaVectorStore(
+                collection_name="temporal_spin",
+                persist_directory=persist_dir
+            )
+        else:
+            vector_store = InMemoryVectorStore(dimension=dimension)
+        
+        # Reinitialize ingestion pipeline
+        ingestion_pipeline = TemporalSpinIngestionPipeline(
+            embedding_client=embedding_client,
+            vector_store=vector_store,
+            t0_seconds=T0_SECONDS
+            # period_seconds deprecated - multi-scale encoding
+        )
+        
+        # Reinitialize retriever
+        retriever = TemporalSpinRetriever(
+            embedding_client=embedding_client,
+            vector_store=vector_store,
+            t0_seconds=T0_SECONDS
+            # period_seconds deprecated - multi-scale encoding
+        )
+        
+        print(f"✓ Vector database cleared successfully")
+        
+        return {
+            "status": "success",
+            "message": "Vector database cleared",
+            "dimension": dimension,
+            "vector_store_type": type(vector_store).__name__,
+            "persist_directory": persist_dir if use_chroma else None
+        }
+    except Exception as e:
+        print(f"✗ Error clearing database: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/temporal_search", response_model=TemporalSearchResponse)
@@ -252,21 +361,47 @@ async def temporal_search(request: TemporalSearchRequest):
     import time
     start_time = time.time()
     
-    # Parse query timestamp
+    # Parse arc or point query timestamps
     query_timestamp = None
-    if request.query_timestamp:
+    query_start_timestamp = None
+    query_end_timestamp = None
+    
+    # Prefer arc queries over point queries
+    if request.query_start_timestamp and request.query_end_timestamp:
+        # Arc query
+        try:
+            query_start_timestamp = datetime.fromisoformat(request.query_start_timestamp.replace('Z', '+00:00'))
+            query_end_timestamp = datetime.fromisoformat(request.query_end_timestamp.replace('Z', '+00:00'))
+            print(f"🔍 API: Arc query parsed: {query_start_timestamp} to {query_end_timestamp}")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid arc timestamp format")
+    elif request.query_timestamp:
+        # Point query (fallback)
         try:
             query_timestamp = datetime.fromisoformat(request.query_timestamp.replace('Z', '+00:00'))
+            print(f"🔍 API: Point query parsed: {query_timestamp}")
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid timestamp format")
+    else:
+        print(f"🔍 API: No timestamp provided, will use NOW")
     
-    # Execute search
+    # Execute search with arc or point query
     try:
+        print(f"🔍 API: Calling retriever.search() with:")
+        print(f"   query_timestamp={query_timestamp}")
+        print(f"   query_start_timestamp={query_start_timestamp}")
+        print(f"   query_end_timestamp={query_end_timestamp}")
+        if request.concept_filter:
+            print(f"   concept_filter={request.concept_filter[:5]}{'...' if len(request.concept_filter) > 5 else ''}")
+        
         results = retriever.search(
             query_text=request.query,
             query_timestamp=query_timestamp,
+            query_start_timestamp=query_start_timestamp,
+            query_end_timestamp=query_end_timestamp,
             beta=request.beta,
-            top_k_final=request.top_k
+            top_k_final=request.top_k,
+            concept_filter=request.concept_filter  # NEW: Pass concept filter
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
@@ -277,6 +412,9 @@ async def temporal_search(request: TemporalSearchRequest):
     formatted_results = []
     for result in results:
         import math
+        # Extract metadata from the SpinDocument
+        metadata = result.metadata if hasattr(result, 'metadata') and result.metadata else {}
+        
         formatted_results.append(TemporalSearchResult(
             rank=result.rank,
             doc_id=result.doc_id,
@@ -287,7 +425,8 @@ async def temporal_search(request: TemporalSearchRequest):
             combined_score=result.combined_score,
             phi_doc=result.phi_doc,
             phi_query=result.phi_query,
-            phi_difference_deg=math.degrees(result.phi_difference)
+            phi_difference_deg=math.degrees(result.phi_difference),
+            metadata=metadata  # Include metadata for agent orchestration
         ))
     
     return TemporalSearchResponse(
@@ -313,13 +452,14 @@ async def ingest_documents(request: IngestRequest):
     try:
         texts = []
         timestamps = []
+        end_timestamps = []
         doc_ids = []
         metadatas = []
         
         for doc in request.documents:
             texts.append(doc.text)
             
-            # Parse timestamp if provided
+            # Parse timestamp if provided (start timestamp for arcs)
             if doc.timestamp:
                 try:
                     ts = datetime.fromisoformat(doc.timestamp.replace('Z', '+00:00'))
@@ -329,13 +469,24 @@ async def ingest_documents(request: IngestRequest):
             else:
                 timestamps.append(None)
             
+            # Parse end_timestamp if provided (for arc encoding)
+            if doc.end_timestamp:
+                try:
+                    end_ts = datetime.fromisoformat(doc.end_timestamp.replace('Z', '+00:00'))
+                    end_timestamps.append(end_ts)
+                except ValueError:
+                    end_timestamps.append(None)
+            else:
+                end_timestamps.append(None)
+            
             doc_ids.append(doc.doc_id)
             metadatas.append(doc.metadata)
         
-        # Ingest batch
+        # Ingest batch with arc encoding support
         ingested_docs = ingestion_pipeline.ingest_batch(
             texts=texts,
             timestamps=timestamps,
+            end_timestamps=end_timestamps,
             doc_ids=doc_ids,
             metadatas=metadatas
         )

@@ -64,6 +64,9 @@ class OpenAIEmbeddingClient:
         """
         Generate embeddings for a list of texts.
         
+        Handles large batches by chunking into smaller requests.
+        OpenAI limits: 2048 texts per request for embedding models.
+        
         Args:
             texts: List of text strings to embed
         
@@ -84,17 +87,47 @@ class OpenAIEmbeddingClient:
         if not texts:
             return []
         
-        # Call OpenAI API
-        response = self.client.embeddings.create(
-            model=self.model,
-            input=texts,
-            encoding_format="float"  # Ensure we get floats, not base64
-        )
+        # Filter out empty texts and track indices
+        valid_texts = []
+        valid_indices = []
+        for i, text in enumerate(texts):
+            if text and text.strip():
+                valid_texts.append(text.strip())
+                valid_indices.append(i)
         
-        # Extract embeddings in order
-        embeddings = [item.embedding for item in response.data]
+        if not valid_texts:
+            # Return zero vectors for empty texts
+            return [[0.0] * self.dimension for _ in texts]
         
-        return embeddings
+        # Chunk into batches of 2000 (safely under OpenAI's 2048 limit)
+        batch_size = 2000
+        all_embeddings = []
+        
+        for i in range(0, len(valid_texts), batch_size):
+            batch = valid_texts[i:i + batch_size]
+            
+            # Call OpenAI API
+            response = self.client.embeddings.create(
+                model=self.model,
+                input=batch,
+                encoding_format="float"  # Ensure we get floats, not base64
+            )
+            
+            # Extract embeddings in order
+            batch_embeddings = [item.embedding for item in response.data]
+            all_embeddings.extend(batch_embeddings)
+        
+        # Reconstruct full list with zero vectors for empty texts
+        result = []
+        valid_idx = 0
+        for i in range(len(texts)):
+            if i in valid_indices:
+                result.append(all_embeddings[valid_idx])
+                valid_idx += 1
+            else:
+                result.append([0.0] * self.dimension)
+        
+        return result
     
     def embed_single(self, text: str) -> List[float]:
         """

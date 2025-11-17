@@ -44,10 +44,25 @@ from dateutil import parser as dateutil_parser
 T0_EPOCH = datetime(2010, 1, 1, tzinfo=timezone.utc)
 T0_SECONDS = T0_EPOCH.timestamp()
 
-# Period for spin encoding (365.25 days × 1000 years)
-# This ensures documents within a millennium have unique phase angles
-# With float64 precision, we can distinguish timestamps down to milliseconds
-PERIOD_SECONDS = 365.25 * 24 * 3600 * 1000
+# Multi-scale temporal encoding periods
+# Three scales for hierarchical temporal resolution:
+#   - QUARTER_SCALE: 1 year (quarterly precision within a year)
+#   - DECADE_SCALE: 16 years (year-to-year discrimination)
+#   - CENTURY_SCALE: 256 years (historical context)
+# Powers of 2 maintain mathematical consistency across scales
+QUARTER_SCALE_YEARS = 1
+DECADE_SCALE_YEARS = 16
+CENTURY_SCALE_YEARS = 256
+
+QUARTER_PERIOD_SECONDS = QUARTER_SCALE_YEARS * 365.25 * 24 * 3600
+DECADE_PERIOD_SECONDS = DECADE_SCALE_YEARS * 365.25 * 24 * 3600
+CENTURY_PERIOD_SECONDS = CENTURY_SCALE_YEARS * 365.25 * 24 * 3600
+
+# Weights for multi-scale temporal alignment
+# Decade scale gets highest weight for year-to-year queries
+QUARTER_WEIGHT = 0.4  # Within-year precision
+DECADE_WEIGHT = 0.5   # Year discrimination (highest)
+CENTURY_WEIGHT = 0.1  # Historical context
 
 # Default embedding dimension (adjust based on your model)
 DEFAULT_EMBEDDING_DIM = 384
@@ -60,100 +75,121 @@ DEFAULT_EMBEDDING_DIM = 384
 def compute_spin_vector(
     timestamp_seconds: float,
     t0_seconds: float = T0_SECONDS,
-    period_seconds: float = PERIOD_SECONDS,
+    period_seconds: float = None,  # Deprecated - now uses multi-scale
     phase_offset: float = 0.0,
     temporal_scale: float = 1.0,
     end_timestamp_seconds: Optional[float] = None
-) -> Tuple[List[float], float, Optional[float], Optional[float]]:
+) -> Tuple[List[float], Dict[str, float], Dict[str, Optional[float]], Dict[str, Optional[float]]]:
     """
-    Map a timestamp (or time interval) to a temporal spin vector.
+    Map a timestamp (or time interval) to a multi-scale temporal spin vector.
     
-    Supports two modes (both return 3D vectors for consistent dimensionality):
-    1. Point mode: Single timestamp → 3D vector [cos(φ), sin(φ), 0.0]
-    2. Arc mode: Start and end timestamps → 3D vector [cos(φ_center), sin(φ_center), arc_length]
+    Multi-scale encoding with 3 hierarchical periods (powers of 2):
+    - Quarter scale (1 year): For quarterly precision within a year
+    - Decade scale (16 years): For year-to-year discrimination  
+    - Century scale (256 years): For historical context
+    
+    Supports two modes (both return 9D vectors for consistent dimensionality):
+    1. Point mode: Single timestamp → 9D vector [x_q, y_q, 0, x_d, y_d, 0, x_c, y_c, 0]
+    2. Arc mode: Time period → 9D vector with arc_length in z components
     
     Args:
         timestamp_seconds: Unix timestamp in seconds (start time for arcs)
         t0_seconds: Base epoch timestamp (default: 2010-01-01)
-        period_seconds: Period length for full rotation (default: 1000 years)
+        period_seconds: Deprecated (kept for backward compatibility, ignored)
         phase_offset: Optional phase shift in radians
         temporal_scale: Scaling factor for spin vector magnitude (default: 1.0)
-                       NOTE: Has no effect on cosine similarity (scale-invariant)
         end_timestamp_seconds: Optional end timestamp for arc mode. If None, uses point mode.
     
     Returns:
-        Tuple of (spin_vector, phi_center, phi_start, phi_end):
-        - spin_vector: Always 3D [cos(φ), sin(φ), arc_length]
-                      (arc_length=0 for points, >0 for arcs)
-        - phi_center: Center angle (equals phi for points)
-        - phi_start: Start angle (None for points, angle for arcs)
-        - phi_end: End angle (None for points, angle for arcs)
+        Tuple of (spin_vector, phi_centers, phi_starts, phi_ends):
+        - spin_vector: Always 9D [x_q, y_q, z_q, x_d, y_d, z_d, x_c, y_c, z_c]
+        - phi_centers: Dict with keys 'quarter', 'decade', 'century'
+        - phi_starts: Dict with start angles for each scale (None for points)
+        - phi_ends: Dict with end angles for each scale (None for points)
     
     Examples:
-        >>> # Point mode
+        >>> # Point mode - single instant in time
         >>> t = datetime(2023, 6, 15, tzinfo=timezone.utc).timestamp()
         >>> spin, phi_c, phi_s, phi_e = compute_spin_vector(t)
-        >>> # Returns: 3D vector with arc_length=0, phi_s=phi_e=None
+        >>> len(spin)  # Returns 9
+        9
         
-        >>> # Arc mode (Q2 2023)
-        >>> t_start = datetime(2023, 4, 1, tzinfo=timezone.utc).timestamp()
-        >>> t_end = datetime(2023, 6, 30, tzinfo=timezone.utc).timestamp()
+        >>> # Arc mode - Q1 2023 (period)
+        >>> t_start = datetime(2023, 1, 1, tzinfo=timezone.utc).timestamp()
+        >>> t_end = datetime(2023, 3, 31, tzinfo=timezone.utc).timestamp()
         >>> spin, phi_c, phi_s, phi_e = compute_spin_vector(t_start, end_timestamp_seconds=t_end)
-        >>> # Returns: 3D vector with arc_length in third component
-    
-    Note on Temporal Control:
-        Use β parameter in retrieval for temporal zoom control, not temporal_scale.
-        Arc encoding allows hierarchical period matching (quarters ⊂ years).
+        >>> # Quarter scale will show ~90° arc, decade/century scales show smaller arcs
     """
-    if period_seconds <= 0:
-        raise ValueError("period_seconds must be positive")
+    periods = {
+        'quarter': QUARTER_PERIOD_SECONDS,
+        'decade': DECADE_PERIOD_SECONDS,
+        'century': CENTURY_PERIOD_SECONDS
+    }
     
-    # Point mode (default): Single timestamp
-    if end_timestamp_seconds is None:
-        # Normalize time to [0, 1) fractional position within period
-        fraction = ((timestamp_seconds - t0_seconds) / period_seconds) % 1.0
-        
-        # Convert to angle: φ ∈ [0, 2π)
-        phi = math.tau * fraction + phase_offset  # tau = 2π
-        
-        # Spin vector on unit circle (3D with arc_length=0 for points)
-        # This ensures consistent dimensionality with arc mode
-        cos_phi = math.cos(phi)
-        sin_phi = math.sin(phi)
-        spin_vector = [temporal_scale * cos_phi, temporal_scale * sin_phi, 0.0]
-        
-        return spin_vector, phi, None, None
+    spin_vector = []
+    phi_centers = {}
+    phi_starts = {}
+    phi_ends = {}
     
-    # Arc mode: Start and end timestamps
-    else:
-        # Compute start and end angles
-        fraction_start = ((timestamp_seconds - t0_seconds) / period_seconds) % 1.0
-        fraction_end = ((end_timestamp_seconds - t0_seconds) / period_seconds) % 1.0
+    # Encode at each scale
+    for scale_name in ['quarter', 'decade', 'century']:
+        period_sec = periods[scale_name]
         
-        phi_start = math.tau * fraction_start + phase_offset
-        phi_end = math.tau * fraction_end + phase_offset
+        # Point mode: Single timestamp
+        if end_timestamp_seconds is None:
+            # Normalize time to [0, 1) fractional position within period
+            fraction = ((timestamp_seconds - t0_seconds) / period_sec) % 1.0
+            
+            # Convert to angle: φ ∈ [0, 2π)
+            phi = math.tau * fraction + phase_offset
+            
+            # Spin vector on unit circle (3D with arc_length=0 for points)
+            cos_phi = math.cos(phi)
+            sin_phi = math.sin(phi)
+            spin_vector.extend([
+                temporal_scale * cos_phi,
+                temporal_scale * sin_phi,
+                0.0  # No arc length for points
+            ])
+            
+            phi_centers[scale_name] = phi
+            phi_starts[scale_name] = None
+            phi_ends[scale_name] = None
         
-        # Handle wrapping: if end < start, arc crosses 0°
-        if phi_end < phi_start:
-            phi_end += math.tau
-        
-        # Compute arc center and length
-        phi_center = (phi_start + phi_end) / 2.0
-        arc_length = phi_end - phi_start
-        
-        # Normalize phi_center back to [0, 2π)
-        phi_center = phi_center % math.tau
-        
-        # Spin vector for arcs (3D: center + arc_length)
-        cos_center = math.cos(phi_center)
-        sin_center = math.sin(phi_center)
-        spin_vector = [
-            temporal_scale * cos_center,
-            temporal_scale * sin_center,
-            arc_length  # Arc length in radians (not scaled)
-        ]
-        
-        return spin_vector, phi_center, phi_start, phi_end
+        # Arc mode: Start and end timestamps
+        else:
+            # Compute start and end angles at this scale
+            fraction_start = ((timestamp_seconds - t0_seconds) / period_sec) % 1.0
+            fraction_end = ((end_timestamp_seconds - t0_seconds) / period_sec) % 1.0
+            
+            phi_start = math.tau * fraction_start + phase_offset
+            phi_end = math.tau * fraction_end + phase_offset
+            
+            # Handle wrapping: if end < start, arc crosses 0°
+            if phi_end < phi_start:
+                phi_end += math.tau
+            
+            # Compute arc center and length
+            phi_center = (phi_start + phi_end) / 2.0
+            arc_length = phi_end - phi_start
+            
+            # Normalize phi_center back to [0, 2π)
+            phi_center = phi_center % math.tau
+            
+            # Spin vector for arcs (3D: center + arc_length)
+            cos_center = math.cos(phi_center)
+            sin_center = math.sin(phi_center)
+            spin_vector.extend([
+                temporal_scale * cos_center,
+                temporal_scale * sin_center,
+                arc_length  # Arc length in radians (not scaled)
+            ])
+            
+            phi_centers[scale_name] = phi_center
+            phi_starts[scale_name] = phi_start
+            phi_ends[scale_name] = phi_end
+    
+    return spin_vector, phi_centers, phi_starts, phi_ends
 
 
 def angular_difference(phi1: float, phi2: float) -> float:
@@ -331,21 +367,21 @@ def extract_timestamp_from_text(
 @dataclass
 class SpinDocument:
     """
-    A document with temporal-phase spin encoding (point or arc mode).
+    A document with multi-scale temporal-phase spin encoding (point or arc mode).
     
     Attributes:
         doc_id: Unique identifier
         text: Original document text
         timestamp: Document timestamp (UTC) - start time for arcs
         semantic_embedding: Semantic embedding vector from model
-        spin_vector: Always 3D [cos(φ), sin(φ), arc_length]
-                    - arc_length=0 for points (instant)
-                    - arc_length>0 for arcs (time period)
-        phi: Phase angle in radians (center angle for arcs)
+        spin_vector: Always 9D [x_q, y_q, z_q, x_d, y_d, z_d, x_c, y_c, z_c]
+                    - z components are 0 for points (instant)
+                    - z components >0 for arcs (time period)
+        phi: Dict with phase angles for each scale {'quarter': φ_q, 'decade': φ_d, 'century': φ_c}
         full_embedding: Concatenated [semantic_embedding + spin_vector]
         end_timestamp: Optional end timestamp for arc mode (None for points)
-        phi_start: Start angle for arcs (None for points)
-        phi_end: End angle for arcs (None for points)
+        phi_start: Dict with start angles for each scale (None values for points)
+        phi_end: Dict with end angles for each scale (None values for points)
         is_arc: True if this is an arc (time period), False if point (instant)
     """
     doc_id: str
@@ -353,12 +389,12 @@ class SpinDocument:
     timestamp: datetime
     semantic_embedding: List[float]
     spin_vector: List[float]
-    phi: float
+    phi: Dict[str, float]
     full_embedding: List[float]
     metadata: Dict[str, Any] = None
     end_timestamp: Optional[datetime] = None
-    phi_start: Optional[float] = None
-    phi_end: Optional[float] = None
+    phi_start: Optional[Dict[str, Optional[float]]] = None
+    phi_end: Optional[Dict[str, Optional[float]]] = None
     is_arc: bool = False
     
     def __post_init__(self):
@@ -372,31 +408,31 @@ class SpinDocument:
 @dataclass
 class SpinQuery:
     """
-    A query with temporal-phase spin encoding (point or arc mode).
+    A query with multi-scale temporal-phase spin encoding (point or arc mode).
     
     Attributes:
         query_text: Query string
         query_timestamp: Target timestamp for retrieval (start for arcs)
         semantic_embedding: Semantic query embedding
-        spin_vector: Always 3D [cos(φ), sin(φ), arc_length]
-        phi: Phase angle in radians (center for arcs)
+        spin_vector: Always 9D [x_q, y_q, z_q, x_d, y_d, z_d, x_c, y_c, z_c]
+        phi: Dict with phase angles for each scale {'quarter': φ_q, 'decade': φ_d, 'century': φ_c}
         lambda_factor: Weight for spin component (default: 1.0)
         full_embedding: Concatenated query vector
         end_timestamp: Optional end timestamp for arc queries
-        phi_start: Start angle for arc queries
-        phi_end: End angle for arc queries
+        phi_start: Dict with start angles for each scale (None values for points)
+        phi_end: Dict with end angles for each scale (None values for points)
         is_arc: True if querying a time period
     """
     query_text: str
     query_timestamp: datetime
     semantic_embedding: List[float]
     spin_vector: List[float]
-    phi: float
+    phi: Dict[str, float]
     lambda_factor: float = 1.0
     full_embedding: List[float] = None
     end_timestamp: Optional[datetime] = None
-    phi_start: Optional[float] = None
-    phi_end: Optional[float] = None
+    phi_start: Optional[Dict[str, Optional[float]]] = None
+    phi_end: Optional[Dict[str, Optional[float]]] = None
     is_arc: bool = False
     
     def __post_init__(self):

@@ -21,8 +21,11 @@ smoothly transition from broad semantic search to temporally-focused retrieval.
 """
 
 import math
+import logging
 from typing import List, Optional, Tuple
 from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
 
 from temporal_spin import (
     SpinQuery,
@@ -34,7 +37,12 @@ from temporal_spin import (
     jaccard_similarity_arcs,
     cosine_similarity,
     T0_SECONDS,
-    PERIOD_SECONDS
+    QUARTER_PERIOD_SECONDS,
+    DECADE_PERIOD_SECONDS,
+    CENTURY_PERIOD_SECONDS,
+    QUARTER_WEIGHT,
+    DECADE_WEIGHT,
+    CENTURY_WEIGHT
 )
 from llamastack_client import LlamaStackEmbeddingClient
 from vector_store import VectorStore
@@ -57,23 +65,23 @@ class TemporalSpinRetriever:
     
     β Parameter (Temporal Zoom Knob):
     ---------------------------------
-    - β = 0: Pure semantic search (time ignored)
-    - β = 10: Weak temporal preference (~1% penalty per year)
-    - β = 100: Moderate temporal focus (~4% penalty per year)
-    - β = 500: Strong temporal focus (~20% penalty per year)
-    - β = 5000: Very strong (exact year prioritized) [DEFAULT]
-    - β = 10000+: Extreme (only exact year matches score well)
+    With 100-year period, phase spacing is ~3.6° per year:
+    - β = 0.0: Pure semantic search (time ignored)
+    - β = 0.3: Light temporal preference
+    - β = 0.5: Balanced temporal-semantic weighting [DEFAULT]
+    - β = 0.7: Strong temporal focus
+    - β = 1.0: Temporal alignment dominates
     
-    The temporal alignment factor is exp(-β × (Δφ)²), where Δφ = 0.0063 rad per year.
+    Combined score = (1-β) × semantic_similarity + β × temporal_alignment
     
-    Penalty for 1 year offset (0.36°):
-    - β=100:  -3.9% (gentle, semantic often wins)
-    - β=500:  -19.5% (balanced)
-    - β=5000: -82% (temporal dominates)
+    With β = 0.5 (50/50 balance):
+    - Same quarter/year gets full temporal boost
+    - Adjacent quarters still score well
+    - Distant years (10+ years apart) are distinguished
+    - Semantic similarity remains important
     
-    Note: High β values (1000-10000) are needed to overcome semantic differences
-    between adjacent years. Lower β allows semantic similarity to dominate.
-    For strict year matching, use β ≥ 5000.
+    Note: Lower β values (0.3-0.7) work well with 100-year period because
+    tighter phase spacing provides stronger temporal signal.
     """
     
     def __init__(
@@ -81,9 +89,9 @@ class TemporalSpinRetriever:
         embedding_client: LlamaStackEmbeddingClient,
         vector_store: VectorStore,
         t0_seconds: float = T0_SECONDS,
-        period_seconds: float = PERIOD_SECONDS,
+        period_seconds: float = None,  # Deprecated - multi-scale now
         default_lambda: float = 1.0,
-        default_beta: float = 5000.0,
+        default_beta: float = 0.5,
         temporal_scale: float = 1.0
     ):
         """
@@ -93,7 +101,7 @@ class TemporalSpinRetriever:
             embedding_client: Client for query embeddings
             vector_store: Vector database with documents
             t0_seconds: Base epoch for spin encoding
-            period_seconds: Period for spin cycles
+            period_seconds: Deprecated (kept for backward compatibility, ignored)
             default_lambda: Default weight for spin in Pass 1 (coarse recall)
             default_beta: Default zoom factor for Pass 2 (re-ranking)
             temporal_scale: Scaling factor for spin vectors (default: 1.0)
@@ -103,7 +111,7 @@ class TemporalSpinRetriever:
         self.embedding_client = embedding_client
         self.vector_store = vector_store
         self.t0_seconds = t0_seconds
-        self.period_seconds = period_seconds
+        # period_seconds is deprecated - multi-scale encoding now used
         self.default_lambda = default_lambda
         self.default_beta = default_beta
         self.temporal_scale = temporal_scale
@@ -112,7 +120,7 @@ class TemporalSpinRetriever:
         self,
         query_text: str,
         query_timestamp: Optional[datetime] = None,
-        lambda_factor: Optional[float] = None,
+        lambda_factor: Optional[datetime] = None,
         end_timestamp: Optional[datetime] = None
     ) -> SpinQuery:
         """
@@ -127,8 +135,11 @@ class TemporalSpinRetriever:
         Returns:
             SpinQuery with embeddings and spin encoding (point or arc)
         """
+        print(f"🔍 CREATE_QUERY: query_ts={query_timestamp}, end_ts={end_timestamp}")
+        
         if query_timestamp is None:
             query_timestamp = datetime.now(timezone.utc)
+            print(f"🔍 CREATE_QUERY: Fell back to NOW: {query_timestamp}")
         
         if query_timestamp.tzinfo is None:
             query_timestamp = query_timestamp.replace(tzinfo=timezone.utc)
@@ -143,10 +154,10 @@ class TemporalSpinRetriever:
         query_seconds = query_timestamp.timestamp()
         end_seconds = end_timestamp.timestamp() if end_timestamp else None
         
-        spin_vector, phi_center, phi_start, phi_end = compute_spin_vector(
+        spin_vector, phi_centers, phi_starts, phi_ends = compute_spin_vector(
             query_seconds,
             self.t0_seconds,
-            self.period_seconds,
+            period_seconds=None,  # Deprecated - multi-scale encoding used
             temporal_scale=self.temporal_scale,
             end_timestamp_seconds=end_seconds
         )
@@ -157,11 +168,11 @@ class TemporalSpinRetriever:
             query_timestamp=query_timestamp,
             semantic_embedding=semantic_embedding,
             spin_vector=spin_vector,
-            phi=phi_center,
+            phi=phi_centers,  # Now a dict with keys 'quarter', 'decade', 'century'
             lambda_factor=lambda_factor,
             end_timestamp=end_timestamp,
-            phi_start=phi_start,
-            phi_end=phi_end,
+            phi_start=phi_starts,  # Now a dict
+            phi_end=phi_ends,  # Now a dict
             is_arc=(end_timestamp is not None)
         )
         
@@ -171,11 +182,14 @@ class TemporalSpinRetriever:
         self,
         query_text: str,
         query_timestamp: Optional[datetime] = None,
+        query_start_timestamp: Optional[datetime] = None,
+        query_end_timestamp: Optional[datetime] = None,
         beta: Optional[float] = None,
         lambda_coarse: float = 0.1,
         top_k_coarse: int = 50,
         top_k_final: int = 10,
-        end_timestamp: Optional[datetime] = None
+        end_timestamp: Optional[datetime] = None,  # Deprecated - use query_end_timestamp
+        concept_filter: Optional[List[str]] = None  # NEW: Filter by XBRL concepts
     ) -> List[RetrievalResult]:
         """
         Execute two-pass temporal-phase spin retrieval.
@@ -185,6 +199,9 @@ class TemporalSpinRetriever:
         Use small λ (e.g., 0.1) to perform broad semantic search.
         This retrieves top_k_coarse candidates that are semantically relevant,
         with only minor temporal weighting.
+        
+        NEW: If concept_filter is provided, constrains retrieval to only documents
+        matching those XBRL concepts (e.g., ['NetIncomeLoss', 'Revenues']).
         
         Pass 2 (Temporal Zoom Re-ranking):
         ----------------------------------
@@ -197,17 +214,43 @@ class TemporalSpinRetriever:
         Args:
             query_text: Query string
             query_timestamp: Target timestamp for retrieval (start for arcs)
+            query_start_timestamp: Arc start timestamp (preferred over query_timestamp)
+            query_end_timestamp: Arc end timestamp
             beta: Zoom factor for temporal focus (default: self.default_beta)
             lambda_coarse: Spin weight for coarse recall (default: 0.1)
             top_k_coarse: Number of candidates from Pass 1 (default: 50)
             top_k_final: Number of final results to return (default: 10)
-            end_timestamp: Optional end timestamp for arc queries
+            end_timestamp: Optional end timestamp for arc queries (deprecated)
+            concept_filter: Optional list of XBRL concepts to filter by
         
         Returns:
             List of RetrievalResult objects, sorted by combined score
         """
+        print(f"🔍 SEARCH CALLED: query_start={query_start_timestamp}, query_end={query_end_timestamp}, query_ts={query_timestamp}")
+        
         if beta is None:
             beta = self.default_beta
+        
+        # Determine if this is an arc or point query
+        # Prefer explicit arc parameters over legacy end_timestamp
+        if query_start_timestamp and query_end_timestamp:
+            # Arc query (new style)
+            query_ts = query_start_timestamp
+            end_ts = query_end_timestamp
+            print(f"🔍 RETRIEVER: ARC QUERY (new): {query_ts} to {end_ts}")
+            logger.info(f"🔍 ARC QUERY: {query_ts} to {end_ts}")
+        elif query_timestamp and end_timestamp:
+            # Arc query (legacy style)
+            query_ts = query_timestamp
+            end_ts = end_timestamp
+            print(f"🔍 RETRIEVER: ARC QUERY (legacy): {query_ts} to {end_ts}")
+            logger.info(f"🔍 ARC QUERY (legacy): {query_ts} to {end_ts}")
+        else:
+            # Point query
+            query_ts = query_timestamp
+            end_ts = None
+            print(f"🔍 RETRIEVER: POINT QUERY: {query_ts}")
+            logger.info(f"🔍 POINT QUERY: {query_ts}")
         
         # ====================================================================
         # PASS 1: COARSE RECALL (broad semantic search)
@@ -216,15 +259,35 @@ class TemporalSpinRetriever:
         # Create query with small λ for broad search
         query = self.create_query(
             query_text=query_text,
-            query_timestamp=query_timestamp,
+            query_timestamp=query_ts,
             lambda_factor=lambda_coarse,
-            end_timestamp=end_timestamp
+            end_timestamp=end_ts
         )
+        
+        # Build metadata filter if concept_filter is provided
+        filter_dict = None
+        if concept_filter:
+            # Filter for facts matching any of the target concepts
+            # Check both 'concept' (local name) and 'concept_full' (namespace-prefixed)
+            filter_dict = {
+                "$and": [
+                    {"chunk_type": "fact"},  # Only filter facts
+                    {
+                        "$or": [
+                            {"concept": {"$in": concept_filter}},
+                            {"concept_full": {"$in": concept_filter}}
+                        ]
+                    }
+                ]
+            }
+            logger.info(f"🔍 CONCEPT FILTER: Constraining retrieval to {len(concept_filter)} concepts")
+            print(f"🔍 CONCEPT FILTER: {concept_filter[:5]}{'...' if len(concept_filter) > 5 else ''}")
         
         # Retrieve top-K candidates from vector store
         candidates = self.vector_store.search(
             query_embedding=query.full_embedding,
-            top_k=top_k_coarse
+            top_k=top_k_coarse,
+            filter_dict=filter_dict  # NEW: Pass metadata filter
         )
         
         if not candidates:
@@ -242,50 +305,113 @@ class TemporalSpinRetriever:
                 doc.semantic_embedding
             )
             
-            # Compute temporal alignment based on point/arc types
+            # ========================================================
+            # MULTI-SCALE TEMPORAL ALIGNMENT
+            # ========================================================
+            # Compute alignment at each scale (quarter, decade, century)
+            # and combine with weights
+            scale_alignments = []
+            scale_weights = [QUARTER_WEIGHT, DECADE_WEIGHT, CENTURY_WEIGHT]
+            delta_phi_avg = 0.0
+            
+            # NEW: Hard boundary check for arc-to-arc queries
+            # If arcs don't overlap at ANY scale, reject the document entirely
+            # This ensures proper year-to-year separation (decade scale) AND
+            # within-year position matching (quarter scale)
             if query.is_arc and doc.is_arc:
-                # Arc-to-arc: Use Jaccard similarity
-                temporal_alignment = jaccard_similarity_arcs(
-                    query.phi_start, query.phi_end,
-                    doc.phi_start, doc.phi_end
-                )
-                delta_phi = 0.0  # Arc overlap is the primary metric
-            elif query.is_arc and not doc.is_arc:
-                # Arc-to-point: Check if point falls within query arc
-                overlap = arc_overlap(query.phi_start, query.phi_end, doc.phi, doc.phi)
-                if overlap > 0:
-                    temporal_alignment = 1.0  # Point is within arc
+                # Check overlap at ALL scales (quarter, decade, century)
+                # If ANY scale has zero overlap, reject the document
+                reject_doc = False
+                
+                for scale_name in ['quarter', 'decade', 'century']:
+                    scale_overlap = arc_overlap(
+                        query.phi_start[scale_name], query.phi_end[scale_name],
+                        doc.phi_start[scale_name], doc.phi_end[scale_name]
+                    )
+                    
+                    if scale_overlap == 0.0:
+                        # HARD REJECT: Document arc doesn't intersect query arc at this scale
+                        # This prevents cross-year bleeding (decade) and ensures temporal accuracy
+                        logger.debug(
+                            f"Rejecting doc (arc boundary at {scale_name} scale): "
+                            f"query [{query.phi_start[scale_name]:.3f}, {query.phi_end[scale_name]:.3f}] "
+                            f"vs doc [{doc.phi_start[scale_name]:.3f}, {doc.phi_end[scale_name]:.3f}] "
+                            f"have zero overlap"
+                        )
+                        reject_doc = True
+                        break  # No need to check other scales
+                
+                if reject_doc:
+                    continue  # Skip to next candidate
+            
+            for scale_name in ['quarter', 'decade', 'century']:
+                query_phi = query.phi[scale_name]
+                doc_phi = doc.phi[scale_name]
+                
+                # Compute alignment at this scale based on point/arc types
+                if query.is_arc and doc.is_arc:
+                    # Arc-to-arc: Use Jaccard similarity
+                    scale_alignment = jaccard_similarity_arcs(
+                        query.phi_start[scale_name], query.phi_end[scale_name],
+                        doc.phi_start[scale_name], doc.phi_end[scale_name]
+                    )
+                elif query.is_arc and not doc.is_arc:
+                    # Arc-to-point: Check if point falls within query arc
+                    overlap = arc_overlap(
+                        query.phi_start[scale_name], query.phi_end[scale_name],
+                        doc_phi, doc_phi
+                    )
+                    if overlap > 0:
+                        scale_alignment = 1.0  # Point is within arc
+                    else:
+                        # Point outside arc: use distance to arc center
+                        delta = angular_difference(query_phi, doc_phi)
+                        scale_alignment = math.exp(-beta * (delta ** 2))
+                elif not query.is_arc and doc.is_arc:
+                    # Point-to-arc: Check if query point falls within doc arc
+                    overlap = arc_overlap(
+                        doc.phi_start[scale_name], doc.phi_end[scale_name],
+                        query_phi, query_phi
+                    )
+                    if overlap > 0:
+                        scale_alignment = 1.0  # Query point is within arc
+                    else:
+                        # Query point outside arc: use distance to arc center
+                        delta = angular_difference(query_phi, doc_phi)
+                        scale_alignment = math.exp(-beta * (delta ** 2))
                 else:
-                    # Point outside arc: use distance to arc center
-                    delta_phi = angular_difference(query.phi, doc.phi)
-                    temporal_alignment = math.exp(-beta * (delta_phi ** 2))
-            elif not query.is_arc and doc.is_arc:
-                # Point-to-arc: Check if query point falls within doc arc
-                overlap = arc_overlap(doc.phi_start, doc.phi_end, query.phi, query.phi)
-                if overlap > 0:
-                    temporal_alignment = 1.0  # Query point is within arc
-                else:
-                    # Query point outside arc: use distance to arc center
-                    delta_phi = angular_difference(query.phi, doc.phi)
-                    temporal_alignment = math.exp(-beta * (delta_phi ** 2))
-            else:
-                # Point-to-point: Use standard angular difference (legacy mode)
-                delta_phi = angular_difference(query.phi, doc.phi)
-                temporal_alignment = math.exp(-beta * (delta_phi ** 2))
+                    # Point-to-point: Use standard angular difference
+                    delta = angular_difference(query_phi, doc_phi)
+                    scale_alignment = math.exp(-beta * (delta ** 2))
+                    delta_phi_avg += delta
+                
+                scale_alignments.append(scale_alignment)
+            
+            # Weighted combination of scale alignments
+            # Decade scale gets highest weight (0.5) for year-to-year discrimination
+            temporal_alignment = sum(
+                w * a for w, a in zip(scale_weights, scale_alignments)
+            ) / sum(scale_weights)
+            
+            # Average delta_phi for reporting (using decade scale as primary)
+            delta_phi = angular_difference(
+                query.phi['decade'], doc.phi['decade']
+            )
             
             # Combined score: semantic similarity weighted by temporal alignment
             combined_score = semantic_score * temporal_alignment
             
             # Create result object
+            # For reporting, use decade-scale phi (highest weight for year discrimination)
             result = RetrievalResult(
                 doc_id=doc.doc_id,
                 text=doc.text,
                 timestamp=doc.timestamp,
                 semantic_score=semantic_score,
-                phi_doc=doc.phi,
-                phi_query=query.phi,
-                phi_difference=delta_phi,
-                temporal_alignment=temporal_alignment,
+                phi_doc=doc.phi['decade'],  # Use decade scale for reporting
+                phi_query=query.phi['decade'],  # Use decade scale for reporting
+                phi_difference=delta_phi,  # Already using decade scale
+                temporal_alignment=temporal_alignment,  # Multi-scale weighted
                 combined_score=combined_score,
                 metadata=doc.metadata
             )
@@ -309,15 +435,16 @@ class TemporalSpinRetriever:
             doc_id_to_find = result.doc_id if hasattr(result, 'doc_id') else None
             
             if doc_id_to_find:
-                # Find the original document to get metadata
-                for doc in self.vector_store.documents:
-                    try:
-                        if hasattr(doc, 'doc_id') and doc.doc_id == doc_id_to_find:
-                            if hasattr(doc, 'metadata') and doc.metadata and isinstance(doc.metadata, dict):
-                                chunk_type = doc.metadata.get('chunk_type', 'legacy')
-                            break
-                    except (AttributeError, TypeError):
-                        continue
+                # Find the original document to get metadata (only works with InMemoryVectorStore)
+                if hasattr(self.vector_store, 'documents'):
+                    for doc in self.vector_store.documents.values():
+                        try:
+                            if hasattr(doc, 'doc_id') and doc.doc_id == doc_id_to_find:
+                                if hasattr(doc, 'metadata') and doc.metadata and isinstance(doc.metadata, dict):
+                                    chunk_type = doc.metadata.get('chunk_type', 'legacy')
+                                break
+                        except (AttributeError, TypeError):
+                            continue
             
             # Apply priority multiplier
             multiplier = PRIORITY_MULTIPLIERS.get(chunk_type, 1.0)
