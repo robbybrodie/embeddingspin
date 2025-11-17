@@ -1,6 +1,6 @@
-# Temporal-Phase Spin Retrieval System
+# Temporal-Phase Spin Retrieval System (Three Circles Method)
 
-**A novel retrieval algorithm that encodes time as an angular spin state on the unit circle, enabling smooth temporal zoom without model retraining.**
+**A novel retrieval algorithm that encodes time using three concurrent angular circles (multi-scale hierarchical encoding), enabling precise temporal matching without model retraining.**
 
 ---
 
@@ -18,17 +18,37 @@ Traditional vector databases fail at **time-series retrieval** for semantically 
 
 **Combined with time-aware chunking strategies, this provides a simple and elegant fix for temporal retrieval in vector databases.**
 
-## 🎯 Core Concept
+## 🎯 Core Concept: Three Circles Method
 
-Traditional retrieval systems treat time as a scalar feature or discrete bucket. This system represents time as a **continuous angular coordinate** on the unit circle:
+Traditional retrieval systems treat time as a scalar feature or discrete bucket. This system represents time using **three concurrent circles** (multi-scale temporal encoding):
 
 ```
-φ = 2π × (t - t₀) / T
+Three hierarchical scales (powers of 2):
+  - Quarter scale:  1 year period   → φ_q (quarterly precision)
+  - Decade scale:   16 year period  → φ_d (year-to-year discrimination)
+  - Century scale:  256 year period → φ_c (historical context)
 
-spin_vector = [cos(φ), sin(φ)]
+For each scale:
+  φ = 2π × ((t - t₀) / period) mod 1.0
 
-full_embedding = [semantic_embedding, spin_vector]
+Multi-scale spin vector (9D):
+  spin = [cos(φ_q), sin(φ_q), z_q,    # Quarter scale
+          cos(φ_d), sin(φ_d), z_d,    # Decade scale
+          cos(φ_c), sin(φ_c), z_c]    # Century scale
+
+  where z = 0 for points, z = arc_length for time periods
+
+Full embedding:
+  full_embedding = [semantic_embedding, spin_vector]
+  dimension = semantic_dim + 9
 ```
+
+**Why three circles?**
+- **Quarter scale**: Distinguishes Q1 from Q2 within the same year
+- **Decade scale**: Primary discriminator for year-to-year separation (highest weight: 0.5)
+- **Century scale**: Provides long-term historical context
+
+This creates a **hierarchical temporal fingerprint** where documents are encoded at multiple resolutions simultaneously.
 
 ### Key Innovation: No Model Retraining Required
 
@@ -41,45 +61,56 @@ The semantic embedding model is **frozen**. Time encoding happens post-hoc in th
 
 ### 🆕 Arc-Based Temporal Encoding (Time Periods)
 
-**NEW**: The system now supports **both point and arc encoding**:
+**NEW**: The system now supports **both point and arc encoding** at each of the three scales:
 
 #### Point Mode
-- Single timestamp → 3D spin vector `[cos(φ), sin(φ), 0.0]`
+- Single timestamp → 9D spin vector with z=0 at all scales
+- `[cos(φ_q), sin(φ_q), 0, cos(φ_d), sin(φ_d), 0, cos(φ_c), sin(φ_c), 0]`
 - For point-in-time events (news articles, tweets, instant messages)
-- `arc_length = 0` for backward compatibility and consistent dimensionality
+- Each scale encodes the point's position on its respective circle
 
 #### Arc Mode
-- Time interval `[t_start, t_end]` → 3D spin vector `[cos(φ_center), sin(φ_center), arc_length]`
+- Time interval `[t_start, t_end]` → 9D spin vector with z=arc_length at each scale
+- `[cos(φ_q_center), sin(φ_q_center), arc_q, cos(φ_d_center), sin(φ_d_center), arc_d, cos(φ_c_center), sin(φ_c_center), arc_c]`
 - For time periods (quarterly reports, annual reviews, multi-day events)
-- `arc_length > 0` encodes the temporal extent of the period
+- Each scale's arc_length encodes how much of that circle the period spans
 
-**Visual Example (100-year circle):**
+**Visual Example (Three Concurrent Circles):**
 
 ```
-Point encoding:      Annual report:        Quarterly report:
-     •               ────────────           ───
-   2023.5            2023 (full year)       Q2 2023
+QUARTER SCALE (1 year):        DECADE SCALE (16 years):      CENTURY SCALE (256 years):
+Q2 2023 report:                2023 annual report:           2010-2025 historical period:
+      ───                            •                              •
+   (90° arc)                    (≈22.5° point)                  (≈5° point)
 
-Arc overlap detection:
-- Quarterly ⊂ Annual: Jaccard = 0.25 (quarter is 25% of year)
-- Adjacent quarters: Jaccard = 0.0 (no overlap)
-- Point within arc: Temporal alignment = 1.0
+Multi-scale overlap detection:
+- Q2 report in annual: Quarter=100%, Decade=100%, Century=100% → Strong match
+- Q2 2023 vs Q2 2024: Quarter=100%, Decade=0%, Century=0% → Rejected (no decade overlap)
+- 2023 vs 2024 docs: Quarter=varies, Decade=0%, Century=0% → Rejected (hard boundary)
 ```
 
-**Arc-Aware Retrieval:**
+**Multi-Scale Arc-Aware Retrieval:**
 
 | Query Type | Document Type | Matching Logic |
 |------------|---------------|----------------|
-| Point → Point | Point → Point | Angular distance (legacy) |
-| Point → Arc | Query falls within doc period? | 1.0 if inside, else distance to center |
-| Arc → Point | Doc falls within query period? | 1.0 if inside, else distance to center |
-| Arc → Arc | Temporal overlap | Jaccard similarity |
+| Point → Point | Point → Point | Multi-scale angular distance (weighted combination) |
+| Point → Arc | Query falls within doc period? | 1.0 if inside at all scales, else distance to center |
+| Arc → Point | Doc falls within query period? | 1.0 if inside at all scales, else distance to center |
+| Arc → Arc | Temporal overlap | **Hard boundary check**: Reject if zero overlap at ANY scale, else weighted Jaccard |
+
+**Key Innovation - Hard Boundary Enforcement:**
+- Arc-to-arc queries check overlap at **all three scales**
+- If ANY scale shows zero overlap → document is **rejected** (not just down-weighted)
+- This prevents temporal bleeding (e.g., 2023 docs contaminating 2024 queries)
+- Decade scale enforces year-to-year separation
+- Quarter scale enforces within-year position matching
+- Century scale provides sanity check for historical boundaries
 
 **Use Cases:**
-- **Financial reporting hierarchy**: 10-Q (quarterly) ⊂ 10-K (annual)
-- **Event periods**: "Q2 2023 performance" retrieves docs from Apr-Jun 2023
-- **Time-series chunking**: Each chunk knows its temporal extent
-- **Periodic data**: Automatically handle wrapping (e.g., fiscal years)
+- **Financial reporting hierarchy**: 10-Q (quarterly) ⊂ 10-K (annual) detected by quarter-scale arc containment
+- **Event periods**: "Q2 2023 performance" retrieves docs from Apr-Jun 2023, hard-rejects 2024 docs
+- **Time-series chunking**: Each chunk knows its temporal extent at multiple resolutions
+- **Periodic data**: Automatically handles wrapping (e.g., fiscal years) at appropriate scale
 
 ## 🔬 How It Works
 
@@ -93,29 +124,44 @@ Arc overlap detection:
    - Uses registered embedding models (e.g., `text-embedding-v1`)
    - No special temporal training needed
 
-3. **Spin Encoding**: Convert timestamp(s) to spin vector
+3. **Multi-Scale Spin Encoding**: Convert timestamp(s) to 9D spin vector (3 scales × 3D each)
    
    **Point mode (single timestamp):**
    ```python
-   fraction = ((timestamp - t₀) / period) % 1.0
-   φ = 2π × fraction
-   spin = [cos(φ), sin(φ), 0.0]  # 3D with arc_length=0
+   # Encode at each of the three scales
+   for scale in [quarter_period, decade_period, century_period]:
+       fraction = ((timestamp - t₀) / scale) % 1.0
+       φ = 2π × fraction
+       spin.extend([cos(φ), sin(φ), 0.0])  # z=0 for points
+   
+   # Result: 9D vector
+   spin = [cos(φ_q), sin(φ_q), 0,    # Quarter scale
+           cos(φ_d), sin(φ_d), 0,    # Decade scale
+           cos(φ_c), sin(φ_c), 0]    # Century scale
    ```
    
    **Arc mode (time interval):**
    ```python
-   φ_start = 2π × ((t_start - t₀) / period) % 1.0
-   φ_end = 2π × ((t_end - t₀) / period) % 1.0
-   φ_center = (φ_start + φ_end) / 2
-   arc_length = φ_end - φ_start
-   spin = [cos(φ_center), sin(φ_center), arc_length]  # 3D with arc_length>0
+   # Encode at each of the three scales
+   for scale in [quarter_period, decade_period, century_period]:
+       φ_start = 2π × ((t_start - t₀) / scale) % 1.0
+       φ_end = 2π × ((t_end - t₀) / scale) % 1.0
+       φ_center = (φ_start + φ_end) / 2
+       arc_length = φ_end - φ_start
+       spin.extend([cos(φ_center), sin(φ_center), arc_length])
+   
+   # Result: 9D vector with arc lengths
+   spin = [cos(φ_q_c), sin(φ_q_c), arc_q,    # Quarter scale arc
+           cos(φ_d_c), sin(φ_d_c), arc_d,    # Decade scale arc
+           cos(φ_c_c), sin(φ_c_c), arc_c]    # Century scale arc
    ```
 
-4. **Concatenation**: Combine semantic + spin into full embedding
+4. **Concatenation**: Combine semantic + multi-scale spin into full embedding
    ```python
-   # Both points and arcs use 3D spin vectors for consistent dimensionality
-   full_embedding = [semantic_embedding..., spin[0], spin[1], spin[2]]
-   # Points have spin[2]=0, arcs have spin[2]=arc_length
+   # Both points and arcs use 9D spin vectors for consistent dimensionality
+   full_embedding = [semantic_embedding..., spin_vector...]
+   # semantic_dim + 9 total dimensions
+   # Points have all z=0, arcs have z=arc_length at each scale
    ```
 
 5. **Storage**: Index in vector database (PGVector, Chroma, or in-memory)
@@ -131,38 +177,56 @@ candidates = vector_db.search(query_full, top_k=50)
 
 Uses small λ to perform broad semantic search with minor temporal weighting.
 
-#### Pass 2: Temporal Zoom Re-ranking (Arc-Aware)
+#### Pass 2: Multi-Scale Temporal Zoom Re-ranking (Arc-Aware)
 
 ```python
 for doc in candidates:
-    # Point-to-point (legacy)
-    if not query.is_arc and not doc.is_arc:
-        Δφ = angular_difference(φ_query, φ_doc)
-        temporal_alignment = exp(-β × (Δφ)²)
+    # HARD BOUNDARY CHECK for arc-to-arc queries
+    if query.is_arc and doc.is_arc:
+        # Check overlap at ALL three scales
+        for scale in ['quarter', 'decade', 'century']:
+            if arc_overlap(query.arc[scale], doc.arc[scale]) == 0:
+                reject_document()  # Zero overlap at any scale = hard reject
+                break
     
-    # Arc-to-arc (new)
-    elif query.is_arc and doc.is_arc:
-        temporal_alignment = jaccard_similarity(query_arc, doc_arc)
+    # Compute alignment at each scale
+    scale_alignments = []
+    for scale in ['quarter', 'decade', 'century']:
+        if query.is_arc and doc.is_arc:
+            # Arc-to-arc: Jaccard similarity
+            alignment = jaccard_similarity(query.arc[scale], doc.arc[scale])
+        elif point-in-arc or arc-contains-point:
+            alignment = 1.0 if overlap > 0 else exp(-β × (Δφ_center)²)
+        else:
+            # Point-to-point: Angular distance
+            Δφ = angular_difference(φ_query[scale], φ_doc[scale])
+            alignment = exp(-β × (Δφ)²)
+        scale_alignments.append(alignment)
     
-    # Point-within-arc or arc-contains-point
-    else:
-        temporal_alignment = 1.0 if overlap > 0 else exp(-β × (Δφ_center)²)
-    
+    # Weighted combination (decade scale has highest weight: 0.5)
+    temporal_alignment = (0.4 × align_q + 0.5 × align_d + 0.1 × align_c)
     score = semantic_similarity × temporal_alignment
 ```
 
-Recomputes scores using **β (zoom factor)** to control temporal focus:
+**Multi-Scale β (zoom factor)** controls temporal focus at each scale:
 
-- **β = 0**: Pure semantic search (time ignored)
-- **β = 100**: Weak temporal preference (~4% penalty per year)
-- **β = 1000**: Moderate temporal focus (~11% penalty per year)
-- **β = 5000**: Strong temporal focus - exact year prioritized **[DEFAULT]**
-- **β = 10000+**: Extreme temporal filter (only exact year matches)
+- **β = 0**: Pure semantic search (time ignored at all scales)
+- **β = 0.3**: Light temporal preference (good for 100-year periods)
+- **β = 0.5**: Balanced temporal-semantic weighting **[DEFAULT for multi-scale]**
+- **β = 0.7**: Strong temporal focus
+- **β = 1.0**: Temporal alignment dominates
 
-The temporal alignment factor `exp(-β × (Δφ)²)`:
+**Key differences from single-scale:**
+- **Lower β values** (0.3-0.7) work well due to three concurrent signals
+- **Decade scale** (weight=0.5) provides primary year-to-year discrimination
+- **Quarter scale** (weight=0.4) handles within-year positioning
+- **Century scale** (weight=0.1) prevents century-crossing errors
+- **Hard boundaries** at arc-to-arc queries prevent temporal bleeding
+
+The temporal alignment factor at each scale:
 - Equals 1.0 when phases align perfectly (Δφ = 0)
 - Decays smoothly as phases diverge
-- Decays faster with larger β (sharper focus)
+- Combined across scales with weights [0.4, 0.5, 0.1]
 
 ## 🚀 Quick Start
 
@@ -209,10 +273,12 @@ curl -X POST "http://localhost:8080/temporal_search" \
   -d '{
     "query": "IBM revenue 2016",
     "query_timestamp": "2016-06-30T00:00:00Z",
-    "beta": 5.0,
+    "beta": 0.5,
     "top_k": 10
   }'
 ```
+
+**Note:** Multi-scale encoding uses lower β values (0.3-0.7 typical) compared to single-scale (5000+).
 
 ### Arc Encoding Usage Example
 
@@ -254,29 +320,31 @@ pipeline.ingest_document(
 )
 ```
 
-**Querying with arc matching:**
+**Querying with multi-scale arc matching:**
 
 ```python
 from retrieval import TemporalSpinRetriever
 
-retriever = TemporalSpinRetriever(client, store, default_beta=5000.0)
+retriever = TemporalSpinRetriever(client, store, default_beta=0.5)
 
 # Query for a specific quarter (arc query)
 results = retriever.search(
     query_text="Q2 2023 revenue growth",
     query_timestamp=datetime(2023, 4, 1),
     end_timestamp=datetime(2023, 6, 30),  # Arc query
-    beta=5000.0
+    beta=0.5  # Multi-scale: lower β works well
 )
 # Returns: Both Q2 report (exact match) and annual report (contains Q2)
+# Hard-rejects: Q2 2024 (zero overlap at decade scale)
 
 # Query for a point in time
 results = retriever.search(
     query_text="March 2023 acquisition",
     query_timestamp=datetime(2023, 3, 15),  # Point query
-    beta=5000.0
+    beta=0.7  # Stronger temporal focus
 )
 # Returns: News article (exact), Q1 report (contains March), annual (contains March)
+# Decade scale ensures only 2023 documents match
 ```
 
 ### Production Setup (LlamaStack + PGVector)
@@ -301,13 +369,15 @@ Includes 10 mock IBM financial reports (2015-2024) with:
 - Natural language suitable for semantic search
 - Explicit date markers for timestamp extraction
 
-**Example Query Demonstrations:**
+**Example Query Demonstrations (Multi-Scale):**
 
 | Query | Timestamp | β | Expected Behavior |
 |-------|-----------|---|-------------------|
-| "IBM revenue" | 2016-06-30 | 5.0 | Prioritizes 2016 report |
-| "IBM cloud strategy" | 2019-12-31 | 10.0 | Focuses on Red Hat acquisition era (2019-2020) |
-| "IBM quantum computing" | 2024-06-30 | 5.0 | Highlights recent 2024 developments |
+| "IBM revenue" | 2016-06-30 | 0.5 | Prioritizes 2016 report (balanced) |
+| "IBM cloud strategy" | 2019-12-31 | 0.7 | Strong focus on 2019-2020 era |
+| "IBM quantum computing" | 2024-06-30 | 0.3 | Light temporal preference, broad search |
+
+**Note:** Lower β values (0.3-0.7) work well with multi-scale encoding due to hierarchical signal amplification.
 
 ## 🏗️ Architecture
 
@@ -327,11 +397,13 @@ Includes 10 mock IBM financial reports (2015-2024) with:
                                 │
                                 ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│              Temporal Spin Encoder                               │
+│              Multi-Scale Temporal Spin Encoder                   │
 │  ┌─────────────────────────────────────────────────────────┐   │
-│  │  φ = 2π × (timestamp - t₀) / period                     │   │
-│  │  spin = [cos(φ), sin(φ)]                                │   │
-│  │  query_full = [semantic, λ × spin]                      │   │
+│  │  For each scale s ∈ {quarter, decade, century}:        │   │
+│  │    φ_s = 2π × ((timestamp - t₀) / period_s) mod 1.0    │   │
+│  │    spin_s = [cos(φ_s), sin(φ_s), z_s]                  │   │
+│  │  spin_vector = concat(spin_q, spin_d, spin_c)  # 9D    │   │
+│  │  query_full = [semantic, λ × spin_vector]              │   │
 │  └─────────────────────────────────────────────────────────┘   │
 └───────────────────────────────┬─────────────────────────────────┘
                                 │
@@ -346,11 +418,18 @@ Includes 10 mock IBM financial reports (2015-2024) with:
                                 │
                                 ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│              PASS 2: Temporal Zoom Re-ranking                    │
+│         PASS 2: Multi-Scale Temporal Zoom Re-ranking             │
 │  ┌─────────────────────────────────────────────────────────┐   │
 │  │  For each candidate:                                     │   │
-│  │    Δφ = angular_difference(φ_query, φ_doc)              │   │
-│  │    alignment = exp(-β × (Δφ)²)                          │   │
+│  │    // Hard boundary check for arc-to-arc                │   │
+│  │    if query.is_arc and doc.is_arc:                      │   │
+│  │      reject if zero overlap at any scale                │   │
+│  │    // Compute alignment at each scale                    │   │
+│  │    for scale in [quarter, decade, century]:             │   │
+│  │      Δφ_s = angular_difference(φ_query[s], φ_doc[s])    │   │
+│  │      align_s = exp(-β × (Δφ_s)²) or jaccard(arcs)       │   │
+│  │    // Weighted combination (decade=0.5 highest)          │   │
+│  │    alignment = Σ(w_s × align_s)                         │   │
 │  │    score = semantic_sim × alignment                      │   │
 │  │  Sort by score, return top-k                             │   │
 │  └─────────────────────────────────────────────────────────┘   │
@@ -393,14 +472,30 @@ embeddingspin/
 | `PORT` | `8080` | API server port |
 | `HOST` | `0.0.0.0` | API server host |
 
-### Temporal Encoding Parameters
+### Multi-Scale Temporal Encoding Parameters
 
 ```python
 T0_EPOCH = datetime(2010, 1, 1)      # Base epoch
-PERIOD_SECONDS = 365.25 * 24 * 3600 * 10  # 10-year period
+
+# Three hierarchical periods (powers of 2)
+QUARTER_SCALE_YEARS = 1              # 1 year period (quarterly precision)
+DECADE_SCALE_YEARS = 16              # 16 year period (year-to-year discrimination)
+CENTURY_SCALE_YEARS = 256            # 256 year period (historical context)
+
+# Scale weights for temporal alignment
+QUARTER_WEIGHT = 0.4                 # Within-year precision
+DECADE_WEIGHT = 0.5                  # Year discrimination (highest)
+CENTURY_WEIGHT = 0.1                 # Historical context
+
+# Default β for multi-scale encoding
+DEFAULT_BETA = 0.5                   # Balanced temporal-semantic weighting
 ```
 
-Adjustable in code for different temporal scales (daily, monthly, yearly cycles).
+**Design rationale:**
+- Powers of 2 maintain mathematical consistency across scales
+- Decade scale gets highest weight (0.5) for primary year-to-year discrimination
+- Quarter scale provides granular within-year positioning
+- Century scale prevents long-term temporal errors
 
 ## 🎓 Use Cases
 
@@ -427,7 +522,7 @@ Timestamp: Last month
 
 ## 🔬 Advanced Features
 
-### Beta Sweep API
+### Beta Sweep API (Multi-Scale)
 
 Compare results across multiple β values:
 
@@ -436,12 +531,19 @@ POST /beta_sweep
 {
   "query": "IBM AI strategy",
   "query_timestamp": "2019-06-30T00:00:00Z",
-  "beta_values": [0, 1, 5, 10, 20],
+  "beta_values": [0, 0.3, 0.5, 0.7, 1.0],
   "top_k": 5
 }
 ```
 
 Returns results for each β, showing smooth transition from semantic to temporal focus.
+
+**Multi-scale β interpretation:**
+- **0**: Pure semantic (all scales ignored)
+- **0.3**: Light temporal preference (year matters, quarters less)
+- **0.5**: Balanced (default, good year discrimination)
+- **0.7**: Strong temporal focus (tight year matching)
+- **1.0**: Temporal dominates (very precise)
 
 ### Custom Timestamp Extraction
 
@@ -486,14 +588,17 @@ Spin encoding works with any embedding model!
 ## 🧪 Testing
 
 ```bash
-# Run demo with mock data
+# Run demo with mock data (uses multi-scale encoding)
 python demo.py
 
-# Test specific query
-python demo.py --query "test query" --timestamp 2020-01-01 --beta 5.0
+# Test specific query (note: lower β for multi-scale)
+python demo.py --query "test query" --timestamp 2020-01-01 --beta 0.5
 
-# Show β sweep
+# Show β sweep (demonstrates multi-scale β range)
 python demo.py --beta-sweep
+
+# Test arc encoding demo
+python arc_demo.py
 
 # Test API endpoints
 pytest tests/  # (if you add tests/)
@@ -526,28 +631,44 @@ python api.py
 
 ## 📚 References & Theory
 
-### Why Spin Encoding?
+### Why Multi-Scale Spin Encoding (Three Circles)?
 
-**Circular representation** of time provides several advantages:
+**Three concurrent circular representations** of time provide hierarchical advantages:
 
-1. **Periodicity**: Natural for recurring patterns (fiscal years, seasons)
-2. **Continuity**: Smooth interpolation between timestamps
-3. **Bounded**: Always 2D, regardless of time range
-4. **Interpretable**: Angular difference has geometric meaning
+1. **Periodicity at multiple scales**: Natural for hierarchical patterns (quarters → years → decades)
+2. **Continuity**: Smooth interpolation between timestamps at each scale
+3. **Bounded**: Always 9D (3 scales × 3D), regardless of time range
+4. **Interpretable**: Angular differences have clear geometric meaning at each scale
+5. **Hierarchical matching**: Documents can match at fine (quarter) or coarse (decade) granularity
+6. **Hard boundaries**: Arc-to-arc queries can enforce strict temporal separation
 
 ### Mathematical Foundation
 
-The temporal alignment factor uses a Gaussian-like kernel in phase space:
+The **multi-scale temporal alignment** combines three Gaussian-like kernels:
 
 ```
-alignment(Δφ; β) = exp(-β × (Δφ)²)
+At each scale s ∈ {quarter, decade, century}:
+  alignment_s(Δφ_s; β) = exp(-β × (Δφ_s)²)
+
+Combined alignment:
+  alignment = w_q × align_quarter + w_d × align_decade + w_c × align_century
+  where w_q=0.4, w_d=0.5, w_c=0.1 (sum to 1.0)
 ```
 
-Properties:
-- Maximum = 1 when Δφ = 0 (perfect alignment)
-- Decays to ≈0.37 at Δφ = 1/√β (characteristic width)
-- At β = 1000: 95% weight within ±0.06 radians (±3.5°, ~1 year)
-- At β = 5000: 95% weight within ±0.03 radians (±1.5°, ~5 months)
+**Properties:**
+- Maximum = 1 when all scales align perfectly (Δφ = 0 at all scales)
+- Decays at different rates per scale (faster for shorter periods)
+- **Quarter scale** (1 year): Δφ changes by 2π per year → rapid decay for cross-year queries
+- **Decade scale** (16 years): Δφ changes by 2π/16 ≈ 0.39 rad/year → primary year discrimination
+- **Century scale** (256 years): Δφ changes by 2π/256 ≈ 0.025 rad/year → historical context
+
+**With β = 0.5 (default):**
+- Quarter scale: exp(-0.5 × (2π)²) ≈ 1.4e-9 for 1 year apart (strong rejection)
+- Decade scale: exp(-0.5 × (0.39)²) ≈ 0.93 for 1 year apart (gentle penalty)
+- Century scale: exp(-0.5 × (0.025)²) ≈ 0.9997 for 1 year apart (negligible)
+
+This **hierarchical decay** enables precise year matching (decade scale) while tolerating
+within-year variations (quarter scale) and maintaining historical sanity checks (century scale).
 
 ### Comparison to Alternatives
 
@@ -556,7 +677,21 @@ Properties:
 | **Scalar timestamp** | Simple | Doesn't capture periodicity |
 | **Discrete buckets** | Interpretable | Hard boundaries, no interpolation |
 | **Learned temporal embeddings** | Flexible | Requires retraining, less interpretable |
-| **Spin encoding (ours)** | No retraining, interpretable, periodic | Assumes periodic patterns |
+| **Single-scale spin encoding** | No retraining, interpretable, periodic | Temporal collisions for large ranges |
+| **Multi-scale spin (ours)** | Hierarchical resolution, no collisions, hard boundaries | More complex (9D vs 2D) |
+
+### Evolution: Single-Scale → Multi-Scale
+
+**Original approach (deprecated):**
+- Single circle with configurable period (e.g., 1000 years)
+- 2D spin vector: `[cos(φ), sin(φ)]`
+- Problem: β values needed to be very high (5000+) to overcome semantic similarity
+
+**Current approach (three circles):**
+- Three concurrent circles with periods: 1 year, 16 years, 256 years
+- 9D spin vector: 3 scales × 3D each
+- Advantage: Lower β values (0.3-0.7) work well due to multi-scale signal
+- Each scale operates at its natural frequency for its purpose
 
 ## 🐛 Troubleshooting
 
