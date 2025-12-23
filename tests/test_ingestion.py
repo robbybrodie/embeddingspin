@@ -11,18 +11,17 @@ Tests the ingestion pipeline:
 - Metadata handling
 """
 
-import pytest
-from datetime import datetime, timezone, timedelta
-import uuid
-
 import sys
 import os
+from datetime import datetime, timezone, timedelta
+
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from temporal_spin import SpinDocument, T0_SECONDS
-from ingestion import TemporalSpinIngestionPipeline
-# Import fixtures and utilities (pytest discovers conftest.py automatically)
-from tests.conftest import get_quarterly_reports
+from temporal_spin import SpinDocument  # noqa: E402
+from ingestion import TemporalSpinIngestionPipeline  # noqa: E402, F401
+from tests.conftest import get_quarterly_reports  # noqa: E402
 
 
 # ============================================================================
@@ -51,7 +50,9 @@ class TestSingleDocumentIngestion:
         assert len(doc.spin_vector) == 9  # Multi-scale: 3 scales × 3D
         assert len(doc.full_embedding) > 9  # Semantic + spin
     
-    def test_ingest_document_extracts_timestamp_from_text(self, ingestion_pipeline):
+    def test_ingest_document_extracts_timestamp_from_text(
+        self, ingestion_pipeline
+    ):
         """Should extract timestamp when not provided."""
         text = "For the period ended 31 December 2019, revenue increased."
         
@@ -131,7 +132,9 @@ class TestSingleDocumentIngestion:
         assert doc.spin_vector[5] > 0
         assert doc.spin_vector[8] > 0
     
-    def test_ingest_document_added_to_vector_store(self, ingestion_pipeline, empty_vector_store):
+    def test_ingest_document_added_to_vector_store(
+        self, ingestion_pipeline, empty_vector_store
+    ):
         """Ingested document should be added to vector store."""
         initial_count = empty_vector_store.count()
         
@@ -157,7 +160,9 @@ class TestSingleDocumentIngestion:
 class TestBatchIngestion:
     """Test batch ingestion of multiple documents."""
     
-    def test_ingest_batch_multiple_documents(self, ingestion_pipeline, empty_vector_store):
+    def test_ingest_batch_multiple_documents(
+        self, ingestion_pipeline, empty_vector_store
+    ):
         """Should ingest multiple documents in batch."""
         texts = [
             "Document 1 about technology",
@@ -187,7 +192,9 @@ class TestBatchIngestion:
             assert retrieved.text == texts[i]
             assert retrieved.timestamp == timestamps[i]
     
-    def test_ingest_batch_with_arc_mode(self, ingestion_pipeline, empty_vector_store):
+    def test_ingest_batch_with_arc_mode(
+        self, ingestion_pipeline, empty_vector_store
+    ):
         """Should ingest batch with arc-encoded documents."""
         reports = get_quarterly_reports()
         
@@ -288,7 +295,9 @@ class TestBatchIngestion:
 class TestEmbeddingGeneration:
     """Test embedding generation and concatenation."""
     
-    def test_semantic_embedding_dimension(self, ingestion_pipeline, mock_embedding_client):
+    def test_semantic_embedding_dimension(
+        self, ingestion_pipeline, mock_embedding_client
+    ):
         """Semantic embedding should match client dimension."""
         doc = ingestion_pipeline.ingest_document(
             text="Test document",
