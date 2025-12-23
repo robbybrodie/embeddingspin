@@ -1,0 +1,4 @@
+# file: /Users/kpeacocke/code/embeddingspin/retrieval.py
+# hypothesis_version: 6.148.8
+
+[0.0, 0.1, 0.5, 1.0, 1.5, 2.0, 3.0, 200, '$and', '$in', '$or', 'No results.', 'century', 'chunk_type', 'concept', 'concept_full', 'decade', 'doc_id', 'documents', 'fact', 'financial_table', 'footnote', 'legacy', 'metadata', 'narrative', 'quarter', '─', '┐', '┘', '┤']

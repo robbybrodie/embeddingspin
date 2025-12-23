@@ -1,0 +1,4 @@
+# file: /Users/kpeacocke/code/embeddingspin/ingestion.py
+# hypothesis_version: 6.148.8
+
+[1.0, 384, 'file_path', 'mock-embed', 'r', 'text-embedding-v1', 'utf-8']

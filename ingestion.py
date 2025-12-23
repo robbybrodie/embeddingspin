@@ -107,9 +107,11 @@ class TemporalSpinIngestionPipeline:
                 fallback=datetime.now(timezone.utc)
             )
         
-        # Ensure timezone-aware
+        # Ensure timezone-aware and convert to UTC
         if timestamp.tzinfo is None:
             timestamp = timestamp.replace(tzinfo=timezone.utc)
+        else:
+            timestamp = timestamp.astimezone(timezone.utc)
         
         # Get semantic embedding from LlamaStack
         semantic_embedding = self.embedding_client.embed_single(text)
@@ -178,7 +180,10 @@ class TemporalSpinIngestionPipeline:
         if timestamps is None:
             timestamps = [None] * n
         if doc_ids is None:
-            doc_ids = [str(uuid.uuid4()) for _ in range(n)]
+            doc_ids = [None] * n
+        # Generate UUIDs for any None doc_ids
+        doc_ids = [doc_id if doc_id is not None else str(uuid.uuid4()) 
+                   for doc_id in doc_ids]
         if metadatas is None:
             metadatas = [{}] * n
         if end_timestamps is None:
@@ -194,6 +199,8 @@ class TemporalSpinIngestionPipeline:
                 )
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
+            else:
+                ts = ts.astimezone(timezone.utc)
             resolved_timestamps.append(ts)
         
         # Batch embedding request (efficient!)
