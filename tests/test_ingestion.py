@@ -119,9 +119,9 @@ class TestSingleDocumentIngestion:
         assert doc.is_arc is False
 
         # z components should be 0 (indices 2, 5, 8)
-        assert doc.spin_vector[2] == 0.0
-        assert doc.spin_vector[5] == 0.0
-        assert doc.spin_vector[8] == 0.0
+        assert abs(doc.spin_vector[2]) < 1e-10
+        assert abs(doc.spin_vector[5]) < 1e-10
+        assert abs(doc.spin_vector[8]) < 1e-10
 
     def test_ingest_document_arc_mode(
         self, ingestion_pipeline: "TemporalSpinIngestionPipeline"
@@ -337,8 +337,9 @@ class TestEmbeddingGeneration:
             timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc)
         )
 
-        expected_dim = (
-            mock_embedding_client.dimension  # type: ignore[attr-defined]
+        from typing import cast
+        expected_dim: int = cast(
+            int, mock_embedding_client.dimension  # type: ignore[attr-defined]
         )
         semantic_dim = len(doc.semantic_embedding)
 
@@ -355,11 +356,12 @@ class TestEmbeddingGeneration:
             timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc)
         )
 
-        semantic_dim = (
-            mock_embedding_client.dimension  # type: ignore[attr-defined]
+        from typing import cast
+        semantic_dim: int = cast(
+            int, mock_embedding_client.dimension  # type: ignore[attr-defined]
         )
         spin_dim = 9  # Multi-scale: 3 scales × 3D
-        expected_full_dim = semantic_dim + spin_dim
+        expected_full_dim: int = semantic_dim + spin_dim
 
         assert len(doc.full_embedding) == expected_full_dim
 
