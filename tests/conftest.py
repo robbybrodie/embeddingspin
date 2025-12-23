@@ -8,7 +8,7 @@ Provides reusable fixtures for testing the temporal spin retrieval system.
 import math
 import pytest
 from datetime import datetime, timezone, timedelta
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import sys
 import os
@@ -95,7 +95,7 @@ def retriever(
 # Sample Data with Known Temporal Relationships
 # ============================================================================
 
-def get_sample_documents() -> List[Tuple[str, datetime, dict]]:
+def get_sample_documents() -> List[Tuple[str, datetime, Dict[str, Any]]]:
     """
     Generate sample documents with known temporal relationships.
 
@@ -177,14 +177,16 @@ def get_sample_documents() -> List[Tuple[str, datetime, dict]]:
     return documents
 
 
-def get_quarterly_reports() -> List[Tuple[str, datetime, datetime, dict]]:
+def get_quarterly_reports() -> (
+    List[Tuple[str, datetime, datetime, Dict[str, Any]]]
+):
     """
     Generate quarterly reports with arc encoding.
 
     Returns:
         List of (text, start_date, end_date, metadata) tuples
     """
-    reports = [
+    reports: List[Tuple[str, datetime, datetime, Dict[str, Any]]] = [
         # 2020 Q1
         (
             "Q1 2020 Financial Report - Revenue $58.3B",
@@ -230,8 +232,8 @@ def get_quarterly_reports() -> List[Tuple[str, datetime, datetime, dict]]:
 # ============================================================================
 
 def assert_temporal_ordering(
-    results, query_date: datetime, tolerance_days: int = 7
-):
+    results: List[Any], query_date: datetime, tolerance_days: int = 7
+) -> None:
     """
     Assert that results are ordered by temporal proximity to query date.
 
@@ -349,7 +351,7 @@ def generate_date_range(
     Returns:
         List of datetime objects
     """
-    dates = []
+    dates: List[datetime] = []
     current = start
     while current <= end:
         dates.append(current)
