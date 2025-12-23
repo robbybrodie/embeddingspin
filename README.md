@@ -230,12 +230,16 @@ The temporal alignment factor at each scale:
 
 ## 🚀 Quick Start
 
+### Pre-req
+
+Ensure you have Python 3.11 or 3.12. 
+Setting up a virtual environment is perferred. 
+
 ### Installation
 
 ```bash
 # Clone or create project directory
 cd embeddingspin
-
 # Install dependencies
 pip install -r requirements.txt
 ```

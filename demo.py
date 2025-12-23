@@ -17,7 +17,6 @@ import argparse
 import math
 from datetime import datetime, timezone
 
-from temporal_spin import T0_SECONDS, PERIOD_SECONDS
 from llamastack_client import MockEmbeddingClient
 from vector_store import InMemoryVectorStore
 from ingestion import TemporalSpinIngestionPipeline
@@ -49,9 +48,10 @@ def demo_ingestion(pipeline: TemporalSpinIngestionPipeline):
     print("Loading IBM financial reports (2015-2024)...")
     reports = generate_ibm_reports()
     
-    texts = [text for text, _ in reports]
-    timestamps = [ts for _, ts in reports]
-    doc_ids = [f"ibm-report-{ts.year}" for _, ts in reports]
+    texts = [text for text, _, _ in reports]
+    timestamps = [ts for _, ts, _ in reports]
+    end_timestamps = [ets for _, _, ets in reports]
+    doc_ids = [f"ibm-report-{ets.year}" for _, _, ets in reports]
     
     print(f"  • Extracting timestamps from documents")
     print(f"  • Computing semantic embeddings (384-dim)")
@@ -62,6 +62,7 @@ def demo_ingestion(pipeline: TemporalSpinIngestionPipeline):
     docs = pipeline.ingest_batch(
         texts=texts,
         timestamps=timestamps,
+        end_timestamps=end_timestamps,
         doc_ids=doc_ids
     )
     
@@ -69,14 +70,16 @@ def demo_ingestion(pipeline: TemporalSpinIngestionPipeline):
     print()
     print("Sample Spin Encodings:")
     print()
-    print("  Year  │  Timestamp         │  Phase (φ)  │  Spin Vector")
+    print("  Year  │  Start Timestamp   │  End Timestamp       │  Phase (φ)  │  Spin Vector - Decade Scale")
     print("  ──────┼────────────────────┼─────────────┼──────────────────────")
     
-    for doc in docs[::2]:  # Show every other year
+    for doc in docs:
         year = doc.timestamp.year
-        phi_deg = math.degrees(doc.phi)
-        spin_x, spin_y = doc.spin_vector
-        print(f"  {year}  │  {doc.timestamp.date()}  │  {phi_deg:6.1f}°     │  [{spin_x:+.3f}, {spin_y:+.3f}]")
+        # Use decade scale (most relevant for annual reports)
+        phi_deg = math.degrees(doc.phi['decade'])
+        # Decade scale is indices 3,4 in the 9D spin vector (quarter=0-2, decade=3-5, century=6-8)
+        spin_x, spin_y = doc.spin_vector[3], doc.spin_vector[4]
+        print(f"  {year}  │  {doc.timestamp.date()}  │  {doc.end_timestamp.date()}  │  {phi_deg:6.1f}°     │  [{spin_x:+.3f}, {spin_y:+.3f}]")
     
     print()
     print("Note: Documents 10 years apart have similar phases (periodic encoding)")
@@ -88,9 +91,13 @@ def demo_basic_search(retriever: TemporalSpinRetriever):
     
     query_text = "IBM revenue and financial performance"
     query_timestamp = datetime(2016, 6, 30, tzinfo=timezone.utc)
+    query_start_timestamp = datetime(2016, 1, 1, tzinfo=timezone.utc)
+    query_end_timestamp = datetime(2016, 12, 31, tzinfo=timezone.utc)
     beta = 5.0
     
     print(f"Query: \"{query_text}\"")
+    print(f"Query Start Timestamp: {query_start_timestamp.date()}")     
+    print(f"Query End Timestamp: {query_end_timestamp.date()}") 
     print(f"Query Timestamp: {query_timestamp.date()}")
     print(f"Temporal Zoom (β): {beta}")
     print()
@@ -101,6 +108,8 @@ def demo_basic_search(retriever: TemporalSpinRetriever):
     
     results = retriever.search(
         query_text=query_text,
+        query_start_timestamp=query_start_timestamp,
+        query_end_timestamp=query_end_timestamp,
         query_timestamp=query_timestamp,
         beta=beta,
         top_k_final=5
@@ -108,7 +117,7 @@ def demo_basic_search(retriever: TemporalSpinRetriever):
     
     print("Top 5 Results:")
     print()
-    print(format_results_table(results, max_text_length=40))
+    print(format_results_table(results, max_text_length=100))
     print()
     print("Interpretation:")
     print("  • Semantic Score: How well document matches query meaning")
@@ -116,14 +125,16 @@ def demo_basic_search(retriever: TemporalSpinRetriever):
     print("  • Combined Score: Semantic × Temporal (final ranking)")
     print("  • Δφ: Angular phase difference (smaller = closer in time)")
 
-
+## TODO: Add query start and end timestamps to the beta sweep
 def demo_beta_sweep(retriever: TemporalSpinRetriever):
     """Demonstrate β parameter sweep to show temporal zoom effect."""
     print_header("STEP 3: TEMPORAL ZOOM DEMONSTRATION (β Sweep)")
     
     query_text = "IBM hybrid cloud and AI strategy"
     query_timestamp = datetime(2019, 12, 31, tzinfo=timezone.utc)
-    
+    query_start_timestamp = datetime(2015, 1, 1, tzinfo=timezone.utc)
+    query_end_timestamp = datetime(2021, 12, 31, tzinfo=timezone.utc)   
+
     print(f"Query: \"{query_text}\"")
     print(f"Query Timestamp: {query_timestamp.date()} (Red Hat acquisition era)")
     print()
@@ -139,6 +150,8 @@ def demo_beta_sweep(retriever: TemporalSpinRetriever):
     sweep_results = retriever.search_with_beta_sweep(
         query_text=query_text,
         query_timestamp=query_timestamp,
+        query_start_timestamp=query_start_timestamp,
+        query_end_timestamp=query_end_timestamp,
         beta_values=beta_values,
         top_k=3
     )
@@ -178,7 +191,9 @@ def demo_multiple_queries(retriever: TemporalSpinRetriever):
         
         results = retriever.search(
             query_text=query_text,
-            query_timestamp=query_timestamp,
+            #query_timestamp=query_timestamp,
+            query_start_timestamp=datetime(query_timestamp.year-1, 1, 1, tzinfo=timezone.utc),
+            query_end_timestamp=datetime(query_timestamp.year+1, 12, 31, tzinfo=timezone.utc),
             beta=5.0,
             top_k_final=3
         )

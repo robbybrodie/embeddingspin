@@ -351,10 +351,11 @@ class TemporalSpinRetriever:
                 # Compute alignment at this scale based on point/arc types
                 if query.is_arc and doc.is_arc:
                     # Arc-to-arc: Use Jaccard similarity
-                    scale_alignment = jaccard_similarity_arcs(
+                    delta = jaccard_similarity_arcs(
                         query.phi_start[scale_name], query.phi_end[scale_name],
                         doc.phi_start[scale_name], doc.phi_end[scale_name]
                     )
+                    scale_alignment = math.exp(-beta * (delta ** 2))
                 elif query.is_arc and not doc.is_arc:
                     # Arc-to-point: Check if point falls within query arc
                     overlap = arc_overlap(
@@ -463,6 +464,8 @@ class TemporalSpinRetriever:
         self,
         query_text: str,
         query_timestamp: Optional[datetime] = None,
+        query_start_timestamp: Optional[datetime] = None,
+        query_end_timestamp: Optional[datetime] = None,
         beta_values: Optional[List[float]] = None,
         top_k: int = 10
     ) -> List[Tuple[float, List[RetrievalResult]]]:
@@ -489,6 +492,8 @@ class TemporalSpinRetriever:
             results = self.search(
                 query_text=query_text,
                 query_timestamp=query_timestamp,
+                query_start_timestamp=query_start_timestamp,
+                query_end_timestamp=query_end_timestamp,
                 beta=beta,
                 top_k_final=top_k
             )
@@ -529,7 +534,7 @@ class TemporalSpinRetriever:
 
 def format_results_table(
     results: List[RetrievalResult],
-    max_text_length: int = 50
+    max_text_length: int = 100
 ) -> str:
     """
     Format retrieval results as a table.
