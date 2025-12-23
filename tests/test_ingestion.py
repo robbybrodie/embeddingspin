@@ -337,7 +337,9 @@ class TestEmbeddingGeneration:
             timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc)
         )
 
-        expected_dim = mock_embedding_client.dimension  # type: ignore[attr-defined]
+        expected_dim = (
+            mock_embedding_client.dimension  # type: ignore[attr-defined]
+        )
         semantic_dim = len(doc.semantic_embedding)
 
         assert semantic_dim == expected_dim
@@ -353,7 +355,9 @@ class TestEmbeddingGeneration:
             timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc)
         )
 
-        semantic_dim = mock_embedding_client.dimension  # type: ignore[attr-defined]
+        semantic_dim = (
+            mock_embedding_client.dimension  # type: ignore[attr-defined]
+        )
         spin_dim = 9  # Multi-scale: 3 scales × 3D
         expected_full_dim = semantic_dim + spin_dim
 
@@ -486,7 +490,7 @@ class TestMetadataHandling:
         from typing import Any
         metadata: dict[str, Any] = {"company": "Apple", "quarter": "Q1"}
 
-        _doc = ingestion_pipeline.ingest_document(
+        _doc = ingestion_pipeline.ingest_document(  # noqa: F841
             text="Test",
             timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc),
             doc_id="test_metadata",
@@ -573,14 +577,14 @@ class TestErrorHandling:
         doc_id = "duplicate_test"
 
         # First ingestion
-        _doc1 = ingestion_pipeline.ingest_document(
+        _doc1 = ingestion_pipeline.ingest_document(  # noqa: F841
             text="First version",
             timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc),
             doc_id=doc_id
         )
 
         # Second ingestion with same ID
-        _doc2 = ingestion_pipeline.ingest_document(
+        _doc2 = ingestion_pipeline.ingest_document(  # noqa: F841
             text="Second version",
             timestamp=datetime(2020, 2, 1, tzinfo=timezone.utc),
             doc_id=doc_id
@@ -609,7 +613,7 @@ class TestArcPeriodValidation:
         # Should either swap or raise error - implementation dependent
         # At minimum, should not crash
         try:
-            _doc = ingestion_pipeline.ingest_document(
+            _doc = ingestion_pipeline.ingest_document(  # noqa: F841
                 text="Invalid arc",
                 timestamp=start,
                 end_timestamp=end
