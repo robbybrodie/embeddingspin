@@ -57,8 +57,8 @@ class TestSingleDocumentIngestion:
         assert len(doc.full_embedding) > 9  # Semantic + spin
 
     def test_ingest_document_extracts_timestamp_from_text(
-        self, ingestion_pipeline
-    ):
+        self, ingestion_pipeline: "TemporalSpinIngestionPipeline"
+    ) -> None:
         """Should extract timestamp when not provided."""
         text = "For the period ended 31 December 2019, revenue increased."
 
@@ -226,7 +226,7 @@ class TestBatchIngestion:
         docs = ingestion_pipeline.ingest_batch(
             texts=texts,
             timestamps=starts,
-            end_timestamps=ends,
+            end_timestamps=ends,  # type: ignore[arg-type]
             metadatas=metadatas
         )
 
@@ -247,7 +247,7 @@ class TestBatchIngestion:
             datetime(2020, 1, 1, tzinfo=timezone.utc),
             datetime(2020, 1, 1, tzinfo=timezone.utc)
         ]
-        end_timestamps = [
+        end_timestamps: list[datetime | None] = [
             None,  # Point mode
             datetime(2020, 3, 31, tzinfo=timezone.utc)  # Arc mode
         ]
@@ -286,12 +286,14 @@ class TestBatchIngestion:
         """Should handle partial doc_id list."""
         texts = ["Doc 1", "Doc 2", "Doc 3"]
         timestamps = [datetime(2020, 1, 1, tzinfo=timezone.utc)] * 3
-        doc_ids = ["explicit_id", None, None]  # Only first has ID
+        doc_ids: list[str | None] = [
+            "explicit_id", None, None
+        ]  # Only first has ID
 
         docs = ingestion_pipeline.ingest_batch(
             texts=texts,
             timestamps=timestamps,
-            doc_ids=doc_ids
+            doc_ids=doc_ids  # type: ignore[arg-type]
         )
 
         assert docs[0].doc_id == "explicit_id"
@@ -307,9 +309,10 @@ class TestBatchIngestion:
             "For fiscal year 2021, revenue was $150M"
         ]
 
+        timestamps_list: list[datetime | None] = [None, None]
         docs = ingestion_pipeline.ingest_batch(
             texts=texts,
-            timestamps=[None, None]  # Will extract
+            timestamps=timestamps_list  # type: ignore[arg-type]
         )
 
         assert docs[0].timestamp.year == 2020
@@ -324,15 +327,17 @@ class TestEmbeddingGeneration:
     """Test embedding generation and concatenation."""
 
     def test_semantic_embedding_dimension(
-        self, ingestion_pipeline, mock_embedding_client
-    ):
+        self,
+        ingestion_pipeline: "TemporalSpinIngestionPipeline",
+        mock_embedding_client: object
+    ) -> None:
         """Semantic embedding should match client dimension."""
         doc = ingestion_pipeline.ingest_document(
             text="Test document",
             timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc)
         )
 
-        expected_dim = mock_embedding_client.dimension
+        expected_dim = mock_embedding_client.dimension  # type: ignore[attr-defined]
         semantic_dim = len(doc.semantic_embedding)
 
         assert semantic_dim == expected_dim
@@ -348,7 +353,7 @@ class TestEmbeddingGeneration:
             timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc)
         )
 
-        semantic_dim = mock_embedding_client.dimension
+        semantic_dim = mock_embedding_client.dimension  # type: ignore[attr-defined]
         spin_dim = 9  # Multi-scale: 3 scales × 3D
         expected_full_dim = semantic_dim + spin_dim
 
@@ -454,7 +459,8 @@ class TestMetadataHandling:
         self, ingestion_pipeline: "TemporalSpinIngestionPipeline"
     ) -> None:
         """Metadata should be preserved in SpinDocument."""
-        metadata = {
+        from typing import Any
+        metadata: dict[str, Any] = {
             "author": "John Doe",
             "category": "technology",
             "tags": ["AI", "ML", "deep learning"],
@@ -477,9 +483,10 @@ class TestMetadataHandling:
         empty_vector_store: "InMemoryVectorStore"
     ) -> None:
         """Metadata should be retrievable from vector store."""
-        metadata = {"company": "Apple", "quarter": "Q1"}
+        from typing import Any
+        metadata: dict[str, Any] = {"company": "Apple", "quarter": "Q1"}
 
-        doc = ingestion_pipeline.ingest_document(
+        _doc = ingestion_pipeline.ingest_document(
             text="Test",
             timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc),
             doc_id="test_metadata",
@@ -487,13 +494,15 @@ class TestMetadataHandling:
         )
 
         retrieved = empty_vector_store.get_document("test_metadata")
+        assert retrieved is not None
         assert retrieved.metadata == metadata
 
     def test_batch_ingestion_preserves_metadata(
         self, ingestion_pipeline: "TemporalSpinIngestionPipeline"
     ) -> None:
         """Batch ingestion should preserve metadata for each document."""
-        metadatas = [
+        from typing import Any
+        metadatas: list[dict[str, Any]] = [
             {"id": 1, "type": "report"},
             {"id": 2, "type": "article"},
             {"id": 3, "type": "memo"}
@@ -564,14 +573,14 @@ class TestErrorHandling:
         doc_id = "duplicate_test"
 
         # First ingestion
-        doc1 = ingestion_pipeline.ingest_document(
+        _doc1 = ingestion_pipeline.ingest_document(
             text="First version",
             timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc),
             doc_id=doc_id
         )
 
         # Second ingestion with same ID
-        doc2 = ingestion_pipeline.ingest_document(
+        _doc2 = ingestion_pipeline.ingest_document(
             text="Second version",
             timestamp=datetime(2020, 2, 1, tzinfo=timezone.utc),
             doc_id=doc_id
@@ -579,6 +588,7 @@ class TestErrorHandling:
 
         # Should be overwritten
         retrieved = empty_vector_store.get_document(doc_id)
+        assert retrieved is not None
         assert retrieved.text == "Second version"
 
 
@@ -599,14 +609,14 @@ class TestArcPeriodValidation:
         # Should either swap or raise error - implementation dependent
         # At minimum, should not crash
         try:
-            doc = ingestion_pipeline.ingest_document(
+            _doc = ingestion_pipeline.ingest_document(
                 text="Invalid arc",
                 timestamp=start,
                 end_timestamp=end
             )
             # If accepted, end should be after start in normalized form
             # or arc should handle wrapping
-            assert doc is not None
+            assert _doc is not None
         except ValueError:
             # Acceptable to raise error for invalid period
             pass
