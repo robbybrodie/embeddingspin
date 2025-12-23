@@ -85,7 +85,7 @@ def compute_spin_vector(
     
     Multi-scale encoding with 3 hierarchical periods (powers of 2):
     - Quarter scale (1 year): For quarterly precision within a year
-    - Decade scale (16 years): For year-to-year discrimination  
+    - Decade scale (16 years): For year-to-year discrimination
     - Century scale (256 years): For historical context
     
     Supports two modes (both return 9D vectors for consistent dimensionality):
@@ -208,7 +208,7 @@ def angular_difference(phi1: float, phi2: float) -> float:
     return min(diff, math.tau - diff)
 
 
-def arc_overlap(phi_start1: float, phi_end1: float, 
+def arc_overlap(phi_start1: float, phi_end1: float,
                 phi_start2: float, phi_end2: float) -> float:
     """
     Compute the overlap (intersection) between two arcs on the unit circle.
@@ -252,7 +252,7 @@ def arc_overlap(phi_start1: float, phi_end1: float,
     
     # Check if arc1 contains arc2's start or if arc2 contains arc1's start
     # This handles wrapping cases
-    def point_in_arc(point: float, arc_start: float, arc_length: float) -> bool:
+    def point_in_arc(point: float, arc_start: float, arc_length: float) -> bool:  # noqa: E501
         """Check if a point is inside an arc (handling wrapping)."""
         diff = (point - arc_start) % math.tau
         return diff <= arc_length
