@@ -43,14 +43,14 @@ def empty_vector_store():
 
 
 @pytest.fixture
-def populated_vector_store(mock_embedding_client):
+def populated_vector_store(mock_embedding_client: MockEmbeddingClient):
     """Provide a vector store with sample documents."""
     store = InMemoryVectorStore()
     pipeline = TemporalSpinIngestionPipeline(
-        embedding_client=mock_embedding_client,
+        embedding_client=mock_embedding_client,  # type: ignore[arg-type]
         vector_store=store
     )
-    
+
     # Add documents with known temporal relationships
     documents = get_sample_documents()
     for text, timestamp, metadata in documents:
@@ -59,7 +59,7 @@ def populated_vector_store(mock_embedding_client):
             timestamp=timestamp,
             metadata=metadata
         )
-    
+
     return store
 
 
@@ -68,19 +68,25 @@ def populated_vector_store(mock_embedding_client):
 # ============================================================================
 
 @pytest.fixture
-def ingestion_pipeline(mock_embedding_client, empty_vector_store):
+def ingestion_pipeline(
+    mock_embedding_client: MockEmbeddingClient,
+    empty_vector_store: InMemoryVectorStore
+):
     """Provide an ingestion pipeline."""
     return TemporalSpinIngestionPipeline(
-        embedding_client=mock_embedding_client,
+        embedding_client=mock_embedding_client,  # type: ignore[arg-type]
         vector_store=empty_vector_store
     )
 
 
 @pytest.fixture
-def retriever(mock_embedding_client, populated_vector_store):
+def retriever(
+    mock_embedding_client: MockEmbeddingClient,
+    populated_vector_store: InMemoryVectorStore
+):
     """Provide a retriever with populated data."""
     return TemporalSpinRetriever(
-        embedding_client=mock_embedding_client,
+        embedding_client=mock_embedding_client,  # type: ignore[arg-type]
         vector_store=populated_vector_store
     )
 
@@ -92,12 +98,12 @@ def retriever(mock_embedding_client, populated_vector_store):
 def get_sample_documents() -> List[Tuple[str, datetime, dict]]:
     """
     Generate sample documents with known temporal relationships.
-    
+
     Returns:
         List of (text, timestamp, metadata) tuples
     """
     base_date = datetime(2020, 1, 1, tzinfo=timezone.utc)
-    
+
     documents = [
         # Same day documents (should cluster together)
         (
@@ -110,56 +116,56 @@ def get_sample_documents() -> List[Tuple[str, datetime, dict]]:
             base_date,
             {"category": "finance", "company": "Apple"}
         ),
-        
+
         # One week apart (should be close)
         (
             "Apple software update released January 8, 2020",
             base_date + timedelta(days=7),
             {"category": "tech", "company": "Apple"}
         ),
-        
+
         # One month apart (should be moderately close)
         (
             "Apple Q1 2020 earnings call February 1, 2020",
             base_date + timedelta(days=31),
             {"category": "finance", "company": "Apple"}
         ),
-        
+
         # Three months apart (same quarter)
         (
             "Apple spring event March 15, 2020",
             base_date + timedelta(days=75),
             {"category": "tech", "company": "Apple"}
         ),
-        
+
         # Six months apart (different quarter, same year)
         (
             "Apple WWDC 2020 June 22, 2020",
             base_date + timedelta(days=173),
             {"category": "tech", "company": "Apple"}
         ),
-        
+
         # One year apart (should be distant)
         (
             "Apple announces new iPhone on January 1, 2021",
             base_date + timedelta(days=366),
             {"category": "tech", "company": "Apple"}
         ),
-        
+
         # Multiple years apart (should be very distant)
         (
             "Apple announces Vision Pro June 5, 2023",
             datetime(2023, 6, 5, tzinfo=timezone.utc),
             {"category": "tech", "company": "Apple"}
         ),
-        
+
         # Arc document - Q1 2020 (January to March)
         (
             "Apple Q1 2020 performance overview",
             datetime(2020, 1, 1, tzinfo=timezone.utc),
             {"category": "finance", "company": "Apple", "period": "Q1"}
         ),
-        
+
         # Arc document - Full year 2020
         (
             "Apple Annual Report 2020",
@@ -167,14 +173,14 @@ def get_sample_documents() -> List[Tuple[str, datetime, dict]]:
             {"category": "finance", "company": "Apple", "period": "annual"}
         ),
     ]
-    
+
     return documents
 
 
 def get_quarterly_reports() -> List[Tuple[str, datetime, datetime, dict]]:
     """
     Generate quarterly reports with arc encoding.
-    
+
     Returns:
         List of (text, start_date, end_date, metadata) tuples
     """
@@ -215,7 +221,7 @@ def get_quarterly_reports() -> List[Tuple[str, datetime, datetime, dict]]:
             {"year": 2021, "quarter": "Q1", "revenue": 89.6}
         ),
     ]
-    
+
     return reports
 
 
@@ -228,7 +234,7 @@ def assert_temporal_ordering(
 ):
     """
     Assert that results are ordered by temporal proximity to query date.
-    
+
     Args:
         results: List of retrieval results
         query_date: Query timestamp
@@ -236,16 +242,16 @@ def assert_temporal_ordering(
     """
     if len(results) < 2:
         return  # Nothing to compare
-    
+
     for i in range(len(results) - 1):
         current_doc = results[i]
         next_doc = results[i + 1]
-        
+
         current_delta = abs(
             (current_doc.timestamp - query_date).total_seconds()
         )
         next_delta = abs((next_doc.timestamp - query_date).total_seconds())
-        
+
         # Current document should be closer or within tolerance
         tolerance_seconds = tolerance_days * 24 * 3600
         assert current_delta <= next_delta + tolerance_seconds, (
@@ -260,14 +266,14 @@ def assert_phase_alignment(
 ):
     """
     Assert that two phase angles are closely aligned.
-    
+
     Args:
         phi1, phi2: Phase angles in radians
         max_difference: Maximum allowed angular difference
     """
     diff = abs(phi1 - phi2) % math.tau
     diff = min(diff, math.tau - diff)  # Shortest arc
-    
+
     assert diff <= max_difference, (
         f"Phase alignment failed: phi1={phi1:.4f}, phi2={phi2:.4f}, "
         f"difference={diff:.4f} > {max_difference}"
@@ -277,7 +283,7 @@ def assert_phase_alignment(
 def assert_arc_contains_point(arc_start: float, arc_end: float, point: float):
     """
     Assert that an arc contains a point on the unit circle.
-    
+
     Args:
         arc_start, arc_end: Arc boundaries in radians
         point: Point to check
@@ -286,7 +292,7 @@ def assert_arc_contains_point(arc_start: float, arc_end: float, point: float):
     arc_start = arc_start % math.tau
     arc_end = arc_end % math.tau
     point = point % math.tau
-    
+
     # Handle wrapping
     if arc_end < arc_start:
         # Arc crosses 0
@@ -334,12 +340,12 @@ def generate_date_range(
 ) -> List[datetime]:
     """
     Generate a range of dates.
-    
+
     Args:
         start: Start date
         end: End date
         step_days: Step size in days
-    
+
     Returns:
         List of datetime objects
     """
@@ -354,10 +360,10 @@ def generate_date_range(
 def generate_quarterly_dates(year: int) -> List[Tuple[datetime, datetime]]:
     """
     Generate quarterly date ranges for a year.
-    
+
     Args:
         year: Year to generate quarters for
-    
+
     Returns:
         List of (start_date, end_date) tuples for each quarter
     """
