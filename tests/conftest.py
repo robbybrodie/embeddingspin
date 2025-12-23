@@ -12,21 +12,14 @@ from typing import List, Tuple
 
 import sys
 import os
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from temporal_spin import (
-    SpinDocument,
-    SpinQuery,
-    T0_EPOCH,
-    T0_SECONDS,
-    QUARTER_PERIOD_SECONDS,
-    DECADE_PERIOD_SECONDS,
-    CENTURY_PERIOD_SECONDS
-)
-from llamastack_client import MockEmbeddingClient
-from vector_store import InMemoryVectorStore
-from ingestion import TemporalSpinIngestionPipeline
-from retrieval import TemporalSpinRetriever
+# noqa: E402 - imports must come after sys.path modification
+from llamastack_client import MockEmbeddingClient  # noqa: E402
+from vector_store import InMemoryVectorStore  # noqa: E402
+from ingestion import TemporalSpinIngestionPipeline  # noqa: E402
+from retrieval import TemporalSpinRetriever  # noqa: E402
 
 
 # ============================================================================
@@ -230,7 +223,9 @@ def get_quarterly_reports() -> List[Tuple[str, datetime, datetime, dict]]:
 # Temporal Test Assertions
 # ============================================================================
 
-def assert_temporal_ordering(results, query_date: datetime, tolerance_days: int = 7):
+def assert_temporal_ordering(
+    results, query_date: datetime, tolerance_days: int = 7
+):
     """
     Assert that results are ordered by temporal proximity to query date.
     
@@ -246,7 +241,9 @@ def assert_temporal_ordering(results, query_date: datetime, tolerance_days: int 
         current_doc = results[i]
         next_doc = results[i + 1]
         
-        current_delta = abs((current_doc.timestamp - query_date).total_seconds())
+        current_delta = abs(
+            (current_doc.timestamp - query_date).total_seconds()
+        )
         next_delta = abs((next_doc.timestamp - query_date).total_seconds())
         
         # Current document should be closer or within tolerance
@@ -258,7 +255,9 @@ def assert_temporal_ordering(results, query_date: datetime, tolerance_days: int 
         )
 
 
-def assert_phase_alignment(phi1: float, phi2: float, max_difference: float = 0.1):
+def assert_phase_alignment(
+    phi1: float, phi2: float, max_difference: float = 0.1
+):
     """
     Assert that two phase angles are closely aligned.
     
@@ -321,7 +320,7 @@ def is_valid_spin_vector(spin: List[float]) -> bool:
 def is_unit_circle_point(x: float, y: float, tolerance: float = 1e-6) -> bool:
     """Check if (x, y) is on the unit circle."""
     magnitude = math.sqrt(x**2 + y**2)
-    return abs(magnitude - 1.0) < tolerance or magnitude == 0.0
+    return abs(magnitude - 1.0) < tolerance or abs(magnitude) < tolerance
 
 
 # ============================================================================
@@ -363,9 +362,21 @@ def generate_quarterly_dates(year: int) -> List[Tuple[datetime, datetime]]:
         List of (start_date, end_date) tuples for each quarter
     """
     quarters = [
-        (datetime(year, 1, 1, tzinfo=timezone.utc), datetime(year, 3, 31, tzinfo=timezone.utc)),
-        (datetime(year, 4, 1, tzinfo=timezone.utc), datetime(year, 6, 30, tzinfo=timezone.utc)),
-        (datetime(year, 7, 1, tzinfo=timezone.utc), datetime(year, 9, 30, tzinfo=timezone.utc)),
-        (datetime(year, 10, 1, tzinfo=timezone.utc), datetime(year, 12, 31, tzinfo=timezone.utc)),
+        (
+            datetime(year, 1, 1, tzinfo=timezone.utc),
+            datetime(year, 3, 31, tzinfo=timezone.utc),
+        ),
+        (
+            datetime(year, 4, 1, tzinfo=timezone.utc),
+            datetime(year, 6, 30, tzinfo=timezone.utc),
+        ),
+        (
+            datetime(year, 7, 1, tzinfo=timezone.utc),
+            datetime(year, 9, 30, tzinfo=timezone.utc),
+        ),
+        (
+            datetime(year, 10, 1, tzinfo=timezone.utc),
+            datetime(year, 12, 31, tzinfo=timezone.utc),
+        ),
     ]
     return quarters

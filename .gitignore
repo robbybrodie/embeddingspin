@@ -76,3 +76,6 @@ temp/
 *.bak
 *.backup
 
+
+# Snyk Security Extension - AI Rules (auto-generated)
+.github/instructions/snyk_rules.instructions.md
