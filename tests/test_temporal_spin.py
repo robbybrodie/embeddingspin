@@ -21,24 +21,19 @@ import pytest
 from hypothesis import assume, given
 from hypothesis import strategies as st
 
+# Modify path to allow imports from parent directory
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from temporal_spin import (
-    QUARTER_PERIOD_SECONDS,
-    T0_SECONDS,  # noqa: E402
-    angular_difference,
-    arc_overlap,
-    compute_spin_vector,
-    cosine_similarity,
-    extract_timestamp_from_text,
-    jaccard_similarity_arcs,
-    normalize_vector,
-)
-from tests.conftest import (
-    is_unit_circle_point,
-    is_valid_phase,  # noqa: E402
-    is_valid_spin_vector,
-)
+# fmt: off
+from temporal_spin import (QUARTER_PERIOD_SECONDS, T0_SECONDS,  # noqa: E402
+                           angular_difference, arc_overlap,
+                           compute_spin_vector, cosine_similarity,
+                           extract_timestamp_from_text,
+                           jaccard_similarity_arcs, normalize_vector)
+from tests.conftest import (is_unit_circle_point, is_valid_phase,  # noqa: E402
+                            is_valid_spin_vector)
+
+# fmt: on
 
 # ============================================================================
 # Tests for compute_spin_vector (Point Mode)
@@ -55,7 +50,9 @@ class TestComputeSpinVectorPoint:
         spin, _, _, _ = result
 
         assert len(spin) == 9, "Spin vector should be 9-dimensional"
-        assert is_valid_spin_vector(spin), "Spin vector should contain finite values"
+        assert is_valid_spin_vector(
+            spin
+        ), "Spin vector should contain finite values"
 
         # z components (indices 2, 5, 8) should be 0 for points
         assert abs(spin[2]) < 1e-10, "Quarter scale z should be 0 for points"
@@ -71,7 +68,9 @@ class TestComputeSpinVectorPoint:
         assert is_unit_circle_point(
             spin[0], spin[1]
         ), "Quarter scale not on unit circle"
-        assert is_unit_circle_point(spin[3], spin[4]), "Decade scale not on unit circle"
+        assert is_unit_circle_point(
+            spin[3], spin[4]
+        ), "Decade scale not on unit circle"
         assert is_unit_circle_point(
             spin[6], spin[7]
         ), "Century scale not on unit circle"
@@ -101,7 +100,9 @@ class TestComputeSpinVectorPoint:
         spin1, phi1, _, _ = compute_spin_vector(timestamp)
         spin2, phi2, _, _ = compute_spin_vector(timestamp)
 
-        assert spin1 == spin2, "Same timestamp should produce identical spin vectors"
+        assert (
+            spin1 == spin2
+        ), "Same timestamp should produce identical spin vectors"
         assert phi1 == phi2, "Same timestamp should produce identical phases"
 
     def test_point_mode_phi_starts_ends_none(self):
@@ -133,7 +134,9 @@ class TestComputeSpinVectorArc:
         spin, _, _, _ = compute_spin_vector(start, end_timestamp_seconds=end)
 
         assert len(spin) == 9, "Arc mode should return 9D vector"
-        assert is_valid_spin_vector(spin), "Spin vector should contain finite values"
+        assert is_valid_spin_vector(
+            spin
+        ), "Spin vector should contain finite values"
 
         # z components should be non-zero for arcs
         assert spin[2] > 0, "Quarter scale z should be > 0 for arcs"
@@ -334,7 +337,9 @@ class TestJaccardSimilarityArcs:
         """Non-overlapping arcs should have Jaccard similarity = 0."""
         arc1_start, arc1_end = 0.0, math.pi / 4
         arc2_start, arc2_end = math.pi / 2, 3 * math.pi / 4
-        similarity = jaccard_similarity_arcs(arc1_start, arc1_end, arc2_start, arc2_end)
+        similarity = jaccard_similarity_arcs(
+            arc1_start, arc1_end, arc2_start, arc2_end
+        )
         assert abs(similarity - 0.0) < 1e-10
 
     def test_half_overlap_similarity(self):
@@ -619,4 +624,5 @@ class TestMultiScaleEncoding:
 
 
 if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
     pytest.main([__file__, "-v"])

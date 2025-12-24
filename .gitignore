@@ -61,6 +61,7 @@ Thumbs.db
 .coverage
 htmlcov/
 .tox/
+.hypothesis/
 
 # Jupyter
 .ipynb_checkpoints/
@@ -74,4 +75,3 @@ temp/
 # Backups
 *.bak
 *.backup
-
