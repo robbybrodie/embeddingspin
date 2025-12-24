@@ -718,7 +718,7 @@ class TestIngestionExceptions:
         )
 
         # Monkey-patch extract_timestamp_from_text to raise exception
-        import ingestion as ing_module
+        ing_module = sys.modules["ingestion"]
 
         original_extract = ing_module.extract_timestamp_from_text
 
