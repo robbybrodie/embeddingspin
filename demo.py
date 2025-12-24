@@ -15,7 +15,7 @@ Usage:
 
 import argparse
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from llamastack_client import MockEmbeddingClient
 from vector_store import InMemoryVectorStore
@@ -144,7 +144,7 @@ def demo_beta_sweep(retriever: TemporalSpinRetriever):
     print("  • β = 20: Very sharp temporal filter")
     print()
     
-    beta_values = [0, 1, 5, 10, 20]
+    beta_values = [0.0, 1.0, 5.0, 10.0, 20.0]
     sweep_results = retriever.search_with_beta_sweep(
         query_text=query_text,
         query_timestamp=query_timestamp,
@@ -179,7 +179,7 @@ def demo_multiple_queries(retriever: TemporalSpinRetriever):
     
     queries = generate_query_examples()
     
-    for i, (query_text, query_timestamp, description) in enumerate(queries[:3], 1):
+    for i, (query_text, query_timestamp, description) in enumerate(queries, 1):
         print(f"\nQuery {i}: \"{query_text}\"")
         print(f"Timestamp: {query_timestamp.date()}")
         print(f"Context: {description}")
@@ -188,8 +188,8 @@ def demo_multiple_queries(retriever: TemporalSpinRetriever):
         results = retriever.search(
             query_text=query_text,
             #query_timestamp=query_timestamp,
-            query_start_timestamp=datetime(query_timestamp.year-1, 1, 1, tzinfo=timezone.utc),
-            query_end_timestamp=datetime(query_timestamp.year+1, 12, 31, tzinfo=timezone.utc),
+            query_start_timestamp=query_timestamp - timedelta(days=90),
+            query_end_timestamp=query_timestamp + timedelta(days=90),
             beta=5.0,
             top_k_final=3
         )

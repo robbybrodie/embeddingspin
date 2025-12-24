@@ -208,6 +208,22 @@ def angular_difference(phi1: float, phi2: float) -> float:
     return min(diff, math.tau - diff)
 
 
+def _normalize_phi_interval(phi_start, phi_end):
+    """
+    Normalize a phi interval to [0, 2π) and handle wrapping.
+    If the interval covers the full circle or more, treat as full circle.
+    Returns (start, end) such that end >= start.
+    """
+    tau = math.tau
+    phi_start = phi_start % tau
+    phi_end = phi_end % tau
+    # If the interval covers the full circle or more, treat as full circle
+    if (phi_end - phi_start) % tau >= tau - 1e-10:
+        return 0.0, tau
+    if phi_end < phi_start:
+        phi_end += tau
+    return phi_start, phi_end
+
 def arc_overlap(phi_start1: float, phi_end1: float, 
                 phi_start2: float, phi_end2: float) -> float:
     """
@@ -229,28 +245,41 @@ def arc_overlap(phi_start1: float, phi_end1: float,
         >>> overlap = arc_overlap(q1_start, q1_end, q2_start, q2_end)
         >>> # Returns 0.0 (adjacent, no overlap)
     """
-    # Normalize all angles to [0, 2π)
-    phi_start1 = phi_start1 % math.tau
-    phi_end1 = phi_end1 % math.tau
-    phi_start2 = phi_start2 % math.tau
-    phi_end2 = phi_end2 % math.tau
-    
-    # Handle wrapping for arc 1
-    if phi_end1 < phi_start1:
-        phi_end1 += math.tau
-    
-    # Handle wrapping for arc 2
-    if phi_end2 < phi_start2:
-        phi_end2 += math.tau
-    
-    # Find intersection
-    intersection_start = max(phi_start1, phi_start2)
-    intersection_end = min(phi_end1, phi_end2)
-    
-    if intersection_end > intersection_start:
-        return intersection_end - intersection_start
-    else:
-        return 0.0
+    # Normalize both intervals
+    phi_start1, phi_end1 = _normalize_phi_interval(phi_start1, phi_end1)
+    phi_start2, phi_end2 = _normalize_phi_interval(phi_start2, phi_end2)
+
+    # If either interval is a full circle, overlap is full circle
+    tau = math.tau
+    if (phi_end1 - phi_start1) >= tau - 1e-10 or (phi_end2 - phi_start2) >= tau - 1e-10:
+        return tau
+
+    # Robust circular interval overlap
+    # Represent both intervals as (start, length)
+    def interval_to_segments(start, end):
+        # Returns a list of (seg_start, seg_end) in [0, 2π), handling wrapping
+        tau = math.tau
+        if end <= tau and start < end:
+            return [(start, end)]
+        elif end > tau:
+            # Wraps around 2π
+            return [(start, tau), (0.0, end - tau)]
+        else:
+            # Should not happen after normalization, but fallback
+            return [(start, end)]
+
+    tau = math.tau
+    segs1 = interval_to_segments(phi_start1, phi_end1)
+    segs2 = interval_to_segments(phi_start2, phi_end2)
+    overlap = 0.0
+    for s1, e1 in segs1:
+        for s2, e2 in segs2:
+            # Compute overlap between [s1, e1] and [s2, e2]
+            left = max(s1, s2)
+            right = min(e1, e2)
+            if right > left:
+                overlap += right - left
+    return min(overlap, tau)
 
 
 def jaccard_similarity_arcs(phi_start1: float, phi_end1: float,

@@ -289,7 +289,7 @@ class TemporalSpinRetriever:
             top_k=top_k_coarse,
             filter_dict=filter_dict  # NEW: Pass metadata filter
         )
-        
+        logger.debug(f"🔍 PASS 1: Retrieved {len(candidates)} candidates from coarse search")
         if not candidates:
             return []
         
@@ -318,17 +318,22 @@ class TemporalSpinRetriever:
             # If arcs don't overlap at ANY scale, reject the document entirely
             # This ensures proper year-to-year separation (decade scale) AND
             # within-year position matching (quarter scale)
+            logger.debug(f"doc.doc_id: {doc.doc_id}")
+            logger.debug(f"Decade: {query.phi_start['decade']} to {query.phi_end['decade']} vs {doc.phi_start['decade']} to {doc.phi_end['decade']}")
+            logger.debug(f"Quarter: {query.phi_start['quarter']} to {query.phi_end['quarter']} vs {doc.phi_start['quarter']} to {doc.phi_end['quarter']}") 
+            logger.debug(f"Century: {query.phi_start['century']} to {query.phi_end['century']} vs {doc.phi_start['century']} to {doc.phi_end['century']}")
             if query.is_arc and doc.is_arc:
                 # Check overlap at ALL scales (quarter, decade, century)
                 # If ANY scale has zero overlap, reject the document
                 reject_doc = False
                 
-                for scale_name in ['quarter', 'decade', 'century']:
+ #               for scale_name in ['quarter', 'decade', 'century']:
+                for scale_name in ['century', 'decade', 'quarter']:
                     scale_overlap = arc_overlap(
                         query.phi_start[scale_name], query.phi_end[scale_name],
                         doc.phi_start[scale_name], doc.phi_end[scale_name]
                     )
-                    
+                    logger.debug(f"Scale: {scale_name}, Overlap: {scale_overlap}")
                     if scale_overlap == 0.0:
                         # HARD REJECT: Document arc doesn't intersect query arc at this scale
                         # This prevents cross-year bleeding (decade) and ensures temporal accuracy
@@ -355,7 +360,7 @@ class TemporalSpinRetriever:
                         query.phi_start[scale_name], query.phi_end[scale_name],
                         doc.phi_start[scale_name], doc.phi_end[scale_name]
                     )
-                    
+                    logger.debug(f"🔍 Jaccard ({scale_name}): {scale_alignment:.3f}")
                 elif query.is_arc and not doc.is_arc:
                     # Arc-to-point: Check if point falls within query arc
                     overlap = arc_overlap(
