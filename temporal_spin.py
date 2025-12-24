@@ -274,19 +274,33 @@ def jaccard_similarity_arcs(phi_start1: float, phi_end1: float,
         >>> sim = jaccard_similarity_arcs(year_start, year_end, q2_start, q2_end)
         >>> # Returns 0.25 (quarter is 25% of year)
     """
-    # Compute arc lengths
-    arc1_length = (phi_end1 - phi_start1) % math.tau
-    arc2_length = (phi_end2 - phi_start2) % math.tau
-    
+    # Normalize angles to [0, 2π)
+    phi_start1 = phi_start1 % math.tau
+    phi_end1 = phi_end1 % math.tau
+    phi_start2 = phi_start2 % math.tau
+    phi_end2 = phi_end2 % math.tau
+
+    # Helper to compute arc length with proper wrapping
+    def _arc_length(start, end):
+        if end >= start:
+            return end - start
+        else:
+            return math.tau - start + end
+
+    arc1_length = _arc_length(phi_start1, phi_end1)
+    arc2_length = _arc_length(phi_start2, phi_end2)
+
     # Compute intersection
     intersection = arc_overlap(phi_start1, phi_end1, phi_start2, phi_end2)
-    
+
     # Compute union
     union = arc1_length + arc2_length - intersection
-    
-    if union == 0:
-        return 0.0
-    
+
+    # Handle edge cases with small epsilon
+    epsilon = 1e-10
+    if union <= epsilon:
+        return 1.0 if intersection > epsilon else 0.0
+
     return intersection / union
 
 

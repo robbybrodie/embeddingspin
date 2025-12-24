@@ -120,7 +120,7 @@ class TemporalSpinRetriever:
         self,
         query_text: str,
         query_timestamp: Optional[datetime] = None,
-        lambda_factor: Optional[datetime] = None,
+        lambda_factor: Optional[float] = None,
         end_timestamp: Optional[datetime] = None
     ) -> SpinQuery:
         """
@@ -351,11 +351,11 @@ class TemporalSpinRetriever:
                 # Compute alignment at this scale based on point/arc types
                 if query.is_arc and doc.is_arc:
                     # Arc-to-arc: Use Jaccard similarity
-                    delta = jaccard_similarity_arcs(
+                    scale_alignment = jaccard_similarity_arcs(
                         query.phi_start[scale_name], query.phi_end[scale_name],
                         doc.phi_start[scale_name], doc.phi_end[scale_name]
                     )
-                    scale_alignment = math.exp(-beta * (delta ** 2))
+                    
                 elif query.is_arc and not doc.is_arc:
                     # Arc-to-point: Check if point falls within query arc
                     overlap = arc_overlap(

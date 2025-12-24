@@ -132,8 +132,6 @@ def demo_beta_sweep(retriever: TemporalSpinRetriever):
     
     query_text = "IBM hybrid cloud and AI strategy"
     query_timestamp = datetime(2019, 12, 31, tzinfo=timezone.utc)
-    query_start_timestamp = datetime(2015, 1, 1, tzinfo=timezone.utc)
-    query_end_timestamp = datetime(2021, 12, 31, tzinfo=timezone.utc)   
 
     print(f"Query: \"{query_text}\"")
     print(f"Query Timestamp: {query_timestamp.date()} (Red Hat acquisition era)")
@@ -150,8 +148,6 @@ def demo_beta_sweep(retriever: TemporalSpinRetriever):
     sweep_results = retriever.search_with_beta_sweep(
         query_text=query_text,
         query_timestamp=query_timestamp,
-        query_start_timestamp=query_start_timestamp,
-        query_end_timestamp=query_end_timestamp,
         beta_values=beta_values,
         top_k=3
     )
