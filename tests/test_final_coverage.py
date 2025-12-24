@@ -367,7 +367,6 @@ class TestRetrievalPointToArc:
             top_k_final=5,
         )
 
-        # Should return results using distance-based scoring (line 380
         # Should return results using distance-based scoring (line 379)
         assert len(results) > 0
 
