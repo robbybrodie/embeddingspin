@@ -492,7 +492,7 @@ class TestMetadataHandling:
         from typing import Any
         metadata: dict[str, Any] = {"company": "Apple", "quarter": "Q1"}
 
-        _doc = ingestion_pipeline.ingest_document(  # noqa: F841
+        ingestion_pipeline.ingest_document(
             text="Test",
             timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc),
             doc_id="test_metadata",
