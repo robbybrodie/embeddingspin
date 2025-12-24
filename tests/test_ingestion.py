@@ -586,7 +586,7 @@ class TestErrorHandling:
         )
 
         # Second ingestion with same ID
-        _doc2 = ingestion_pipeline.ingest_document(  # noqa: F841
+        ingestion_pipeline.ingest_document(
             text="Second version",
             timestamp=datetime(2020, 2, 1, tzinfo=timezone.utc),
             doc_id=doc_id
