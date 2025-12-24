@@ -24,12 +24,12 @@ from retrieval import TemporalSpinRetriever  # noqa: E402
 from tests.conftest import get_quarterly_reports  # noqa: E402
 
 if TYPE_CHECKING:
-    from vector_store import InMemoryVectorStore  # noqa: F401
+    from vector_store import InMemoryVectorStore
 
 
-# ============================================================================
+# ========================================================================
 # Tests for Basic Retrieval
-# ============================================================================
+# ========================================================================
 
 
 class TestBasicRetrieval:
@@ -37,7 +37,7 @@ class TestBasicRetrieval:
 
     def test_retriever_returns_results(
         self, retriever: TemporalSpinRetriever
-    ) -> None:  # noqa: E501
+    ) -> None:
         """Retriever should return non-empty results."""
         results = retriever.search(
             query_text="Apple revenue",
@@ -82,14 +82,16 @@ class TestBasicRetrieval:
 
         # Verify descending order
         for i in range(len(results) - 1):
-            assert results[i].combined_score >= results[i + 1].combined_score, (
+            assert (
+                results[i].combined_score >= results[i + 1].combined_score
+            ), (
                 f"Rank {i+1} score {results[i].combined_score} < "
                 f"Rank {i+2} score {results[i+1].combined_score}"
             )
 
     def test_ranks_assigned_correctly(
         self, retriever: TemporalSpinRetriever
-    ) -> None:  # noqa: E501
+    ) -> None:
         """Ranks should be sequential starting from 1."""
         results = retriever.search(
             query_text="Apple",
@@ -103,9 +105,9 @@ class TestBasicRetrieval:
         assert actual_ranks == expected_ranks
 
 
-# ============================================================================
+# ========================================================================
 # Tests for Beta Parameter Effects
-# ============================================================================
+# ========================================================================
 
 
 class TestBetaParameterEffects:
@@ -113,7 +115,7 @@ class TestBetaParameterEffects:
 
     def test_beta_zero_pure_semantic(
         self, retriever: TemporalSpinRetriever
-    ) -> None:  # noqa: E501
+    ) -> None:
         """Beta=0 should ignore temporal alignment."""
         # Query with same timestamp as multiple docs
         query_date = datetime(2020, 1, 1, tzinfo=timezone.utc)
@@ -135,7 +137,7 @@ class TestBetaParameterEffects:
 
     def test_beta_high_temporal_focus(
         self, retriever: TemporalSpinRetriever
-    ) -> None:  # noqa: E501
+    ) -> None:
         """High beta should prioritize temporal proximity."""
         query_date = datetime(2020, 1, 1, tzinfo=timezone.utc)
 
@@ -180,24 +182,25 @@ class TestBetaParameterEffects:
         low_beta_order = [r.doc_id for r in results_low_beta]
         high_beta_order = [r.doc_id for r in results_high_beta]
 
-        # Rankings should differ (unless all docs are at exact same time)
+        # Rankings should differ (unless all docs are same time)
         # At minimum, scores should differ
         assert (
             low_beta_order != high_beta_order
-            or results_low_beta[0].combined_score != results_high_beta[0].combined_score
+            or results_low_beta[0].combined_score
+            != results_high_beta[0].combined_score
         )
 
     def test_temporal_alignment_decreases_with_distance(
         self, retriever: TemporalSpinRetriever
     ) -> None:
-        """Temporal alignment should decrease as time distance increases."""
+        """Temporal alignment should decrease with distance."""
         query_date = datetime(2020, 1, 1, tzinfo=timezone.utc)
 
         results = retriever.search(
             query_text="Apple",
             query_timestamp=query_date,
             beta=0.5,
-            top_k_final=10,  # noqa: E501
+            top_k_final=10,
         )
 
         # Find results with increasing time distance
@@ -217,12 +220,14 @@ class TestBetaParameterEffects:
             if (
                 time_diff_farthest > time_diff_closest + 30
             ):  # At least 1 month difference
-                assert closest.temporal_alignment >= farthest.temporal_alignment
+                assert (
+                    closest.temporal_alignment >= farthest.temporal_alignment
+                )
 
 
-# ============================================================================
+# ========================================================================
 # Tests for Arc-Based Queries
-# ============================================================================
+# ========================================================================
 
 
 class TestArcBasedQueries:
@@ -231,7 +236,7 @@ class TestArcBasedQueries:
     def test_arc_query_uses_both_timestamps(
         self,
         mock_embedding_client: Mock,
-        empty_vector_store: InMemoryVectorStore,
+        empty_vector_store: "InMemoryVectorStore",
     ) -> None:
         """Arc query should use both start and end timestamps."""
         from ingestion import TemporalSpinIngestionPipeline
@@ -239,19 +244,22 @@ class TestArcBasedQueries:
         # Ingest quarterly reports as arcs
         pipeline = TemporalSpinIngestionPipeline(
             embedding_client=mock_embedding_client,
-            vector_store=empty_vector_store,  # noqa: E501
+            vector_store=empty_vector_store,
         )
 
         reports = get_quarterly_reports()
         for text, start, end, metadata in reports:
             pipeline.ingest_document(
-                text=text, timestamp=start, end_timestamp=end, metadata=metadata
+                text=text,
+                timestamp=start,
+                end_timestamp=end,
+                metadata=metadata,
             )
 
         # Create retriever
         retriever = TemporalSpinRetriever(
             embedding_client=mock_embedding_client,
-            vector_store=empty_vector_store,  # noqa: E501
+            vector_store=empty_vector_store,
         )
 
         # Query with arc (Q1 2020)
@@ -268,14 +276,14 @@ class TestArcBasedQueries:
     def test_arc_to_arc_exact_match_high_score(
         self,
         mock_embedding_client: Mock,
-        empty_vector_store: InMemoryVectorStore,
+        empty_vector_store: "InMemoryVectorStore",
     ) -> None:
-        """Arc query matching exact arc document should have high score."""
+        """Arc query matching exact arc document has high score."""
         from ingestion import TemporalSpinIngestionPipeline
 
         pipeline = TemporalSpinIngestionPipeline(
             embedding_client=mock_embedding_client,
-            vector_store=empty_vector_store,  # noqa: E501
+            vector_store=empty_vector_store,
         )
 
         # Ingest Q1 2020 as arc
@@ -288,7 +296,7 @@ class TestArcBasedQueries:
 
         retriever = TemporalSpinRetriever(
             embedding_client=mock_embedding_client,
-            vector_store=empty_vector_store,  # noqa: E501
+            vector_store=empty_vector_store,
         )
 
         # Query with exact same arc
@@ -308,14 +316,14 @@ class TestArcBasedQueries:
     def test_arc_to_arc_zero_overlap_rejected(
         self,
         mock_embedding_client: Mock,
-        empty_vector_store: InMemoryVectorStore,
+        empty_vector_store: "InMemoryVectorStore",
     ) -> None:
         """Arc query with zero overlap should reject document."""
         from ingestion import TemporalSpinIngestionPipeline
 
         pipeline = TemporalSpinIngestionPipeline(
             embedding_client=mock_embedding_client,
-            vector_store=empty_vector_store,  # noqa: E501
+            vector_store=empty_vector_store,
         )
 
         # Ingest Q1 2020
@@ -326,7 +334,7 @@ class TestArcBasedQueries:
             doc_id="q1_2020",
         )
 
-        # Ingest Q1 2021 (different year, should be rejected by decade scale)
+        # Ingest Q1 2021 (different year, rejected by decade scale)
         pipeline.ingest_document(
             text="Q1 2021 report",
             timestamp=datetime(2021, 1, 1, tzinfo=timezone.utc),
@@ -336,7 +344,7 @@ class TestArcBasedQueries:
 
         retriever = TemporalSpinRetriever(
             embedding_client=mock_embedding_client,
-            vector_store=empty_vector_store,  # noqa: E501
+            vector_store=empty_vector_store,
         )
 
         # Query for Q1 2020
@@ -351,21 +359,20 @@ class TestArcBasedQueries:
         # Q1 2021 should not appear
         # (hard boundary check at decade scale)
         result_ids = [r.doc_id for r in results]
-        assert (
-            "q1_2021" not in result_ids
-        ), "Q1 2021 should be rejected (zero overlap at decade scale)"
+        msg = "Q1 2021 should be rejected (zero overlap at decade scale)"
+        assert "q1_2021" not in result_ids, msg
 
     def test_point_query_to_arc_document(
         self,
         mock_embedding_client: Mock,
-        empty_vector_store: InMemoryVectorStore,
+        empty_vector_store: "InMemoryVectorStore",
     ) -> None:
-        """Point query should match arc document if point falls within arc."""
+        """Point query should match arc document if point within arc."""
         from ingestion import TemporalSpinIngestionPipeline
 
         pipeline = TemporalSpinIngestionPipeline(
             embedding_client=mock_embedding_client,
-            vector_store=empty_vector_store,  # noqa: E501
+            vector_store=empty_vector_store,
         )
 
         # Ingest full year 2020 as arc
@@ -378,7 +385,7 @@ class TestArcBasedQueries:
 
         retriever = TemporalSpinRetriever(
             embedding_client=mock_embedding_client,
-            vector_store=empty_vector_store,  # noqa: E501
+            vector_store=empty_vector_store,
         )
 
         # Query with point inside the arc (June 2020)
@@ -395,9 +402,9 @@ class TestArcBasedQueries:
         assert results[0].temporal_alignment > 0.9
 
 
-# ============================================================================
+# ========================================================================
 # Tests for Multi-Scale Temporal Alignment
-# ============================================================================
+# ========================================================================
 
 
 class TestMultiScaleAlignment:
@@ -406,7 +413,7 @@ class TestMultiScaleAlignment:
     def test_same_quarter_high_alignment(
         self, retriever: TemporalSpinRetriever
     ) -> None:
-        """Documents from same quarter should have high temporal alignment."""
+        """Documents from same quarter should have high alignment."""
         # Query in January 2020
         query_date = datetime(2020, 1, 15, tzinfo=timezone.utc)
 
@@ -414,12 +421,14 @@ class TestMultiScaleAlignment:
             query_text="Apple",
             query_timestamp=query_date,
             beta=0.5,
-            top_k_final=10,  # noqa: E501
+            top_k_final=10,
         )
 
         # Find January 2020 documents
         jan_2020_results = [
-            r for r in results if r.timestamp.year == 2020 and r.timestamp.month == 1
+            r
+            for r in results
+            if r.timestamp.year == 2020 and r.timestamp.month == 1
         ]
 
         if jan_2020_results:
@@ -430,8 +439,10 @@ class TestMultiScaleAlignment:
                     f"got {result.temporal_alignment}"
                 )
 
-    def test_different_year_separation(self, retriever: TemporalSpinRetriever) -> None:
-        """Documents from different years should be well-separated."""
+    def test_different_year_separation(
+        self, retriever: TemporalSpinRetriever
+    ) -> None:
+        """Documents from different years should be separated."""
         # Query in 2020
         query_date = datetime(2020, 6, 1, tzinfo=timezone.utc)
 
@@ -446,15 +457,16 @@ class TestMultiScaleAlignment:
         results_2020 = [r for r in results if r.timestamp.year == 2020]
         results_2023 = [r for r in results if r.timestamp.year == 2023]
 
-        # Just verify that both years are present and have different
-        # temporal alignments (the direction may vary with mock embeddings)
+        # Just verify that both years are present and have
+        # different temporal alignments (direction may vary
+        # with mock embeddings)
         if results_2020 and results_2023:
-            avg_alignment_2020 = sum(r.temporal_alignment for r in results_2020) / len(
-                results_2020
-            )
-            avg_alignment_2023 = sum(r.temporal_alignment for r in results_2023) / len(
-                results_2023
-            )
+            avg_alignment_2020 = sum(
+                r.temporal_alignment for r in results_2020
+            ) / len(results_2020)
+            avg_alignment_2023 = sum(
+                r.temporal_alignment for r in results_2023
+            ) / len(results_2023)
 
             # Check that alignments are meaningfully different
             assert abs(avg_alignment_2020 - avg_alignment_2023) > 0.01, (
@@ -465,14 +477,14 @@ class TestMultiScaleAlignment:
     def test_decade_scale_year_discrimination(
         self,
         mock_embedding_client: Mock,
-        empty_vector_store: InMemoryVectorStore,
+        empty_vector_store: "InMemoryVectorStore",
     ) -> None:
-        """Decade scale should provide strong year-to-year discrimination."""
+        """Decade scale provides year-to-year discrimination."""
         from ingestion import TemporalSpinIngestionPipeline
 
         pipeline = TemporalSpinIngestionPipeline(
             embedding_client=mock_embedding_client,
-            vector_store=empty_vector_store,  # noqa: E501
+            vector_store=empty_vector_store,
         )
 
         # Ingest documents from 2019, 2020, 2021
@@ -485,7 +497,7 @@ class TestMultiScaleAlignment:
 
         retriever = TemporalSpinRetriever(
             embedding_client=mock_embedding_client,
-            vector_store=empty_vector_store,  # noqa: E501
+            vector_store=empty_vector_store,
         )
 
         # Query for 2020
@@ -496,11 +508,11 @@ class TestMultiScaleAlignment:
             top_k_final=3,
         )
 
-        # 2020 should be in results and have highest temporal alignment
+        # 2020 should be in results with highest alignment
         result_ids = [r.doc_id for r in results]
-        assert "report_2020" in result_ids, "2020 should be in results"
+        assert "report_2020" in result_ids, "2020 in results"
 
-        # Find 2020 report and check it has best temporal alignment
+        # Find 2020 report and check it has best alignment
         report_2020 = next(r for r in results if r.doc_id == "report_2020")
         other_reports = [r for r in results if r.doc_id != "report_2020"]
 
@@ -508,15 +520,15 @@ class TestMultiScaleAlignment:
             # 2020 should have better or equal temporal alignment
             max_other_alignment = max(
                 r.temporal_alignment for r in other_reports
-            )  # noqa: E501
+            )
             assert (
                 report_2020.temporal_alignment >= max_other_alignment * 0.95
             ), "2020 report should have highest temporal alignment"
 
 
-# ============================================================================
+# ========================================================================
 # Tests for Two-Pass Algorithm
-# ============================================================================
+# ========================================================================
 
 
 class TestTwoPassAlgorithm:
@@ -524,10 +536,10 @@ class TestTwoPassAlgorithm:
 
     def test_pass_one_coarse_recall(
         self, retriever: TemporalSpinRetriever
-    ) -> None:  # noqa: E501
+    ) -> None:
         """Pass 1 should retrieve candidates with broad search."""
-        # This is implicitly tested, but we can verify by checking
-        # that we get results even with high beta
+        # This is implicitly tested, but we can verify by
+        # checking that we get results even with high beta
         results = retriever.search(
             query_text="Apple",
             query_timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc),
@@ -538,22 +550,31 @@ class TestTwoPassAlgorithm:
 
         assert len(results) > 0, "Pass 1 should retrieve candidates"
 
-    def test_pass_two_reranking(self, retriever: TemporalSpinRetriever) -> None:
-        """Pass 2 should rerank results based on temporal alignment."""
+    def test_pass_two_reranking(
+        self, retriever: TemporalSpinRetriever
+    ) -> None:
+        """Pass 2 should rerank results by temporal alignment."""
         # Use a date that doesn't exactly match any document
         query_date = datetime(2020, 3, 15, tzinfo=timezone.utc)
 
         # Low beta (more semantic)
         results_low = retriever.search(
-            query_text="Apple", query_timestamp=query_date, beta=0.3, top_k_final=5
+            query_text="Apple",
+            query_timestamp=query_date,
+            beta=0.3,
+            top_k_final=5,
         )
 
         # High beta (more temporal)
         results_high = retriever.search(
-            query_text="Apple", query_timestamp=query_date, beta=0.8, top_k_final=5
+            query_text="Apple",
+            query_timestamp=query_date,
+            beta=0.8,
+            top_k_final=5,
         )
 
-        # With different beta values, either rankings or scores should differ
+        # With different beta values, either rankings or scores
+        # should differ
         if len(results_low) > 1 and len(results_high) > 1:
             low_order = [r.doc_id for r in results_low]
             high_order = [r.doc_id for r in results_high]
@@ -569,14 +590,13 @@ class TestTwoPassAlgorithm:
                 for i in range(min(len(low_alignments), len(high_alignments)))
             )
 
-            assert (
-                order_differs or alignments_differ
-            ), "Different beta values should affect rankings or alignments"
+            msg = "Different beta values should affect rankings or alignments"
+            assert order_differs or alignments_differ, msg
 
     def test_lambda_coarse_affects_recall(
         self, retriever: TemporalSpinRetriever
     ) -> None:
-        """Lambda parameter in Pass 1 should affect candidate recall."""
+        """Lambda parameter in Pass 1 should affect recall."""
         # This tests that lambda_coarse parameter is being used
         results = retriever.search(
             query_text="Apple",
@@ -586,12 +606,13 @@ class TestTwoPassAlgorithm:
             top_k_final=5,
         )
 
-        assert len(results) > 0, "Should get results with standard lambda"
+        msg = "Should get results with standard lambda"
+        assert len(results) > 0, msg
 
 
-# ============================================================================
+# ========================================================================
 # Tests for Edge Cases
-# ============================================================================
+# ========================================================================
 
 
 class TestEdgeCases:
@@ -612,7 +633,7 @@ class TestEdgeCases:
 
     def test_future_query_timestamp(
         self, retriever: TemporalSpinRetriever
-    ) -> None:  # noqa: E501
+    ) -> None:
         """Query with future timestamp should work."""
         future_date = datetime(2030, 1, 1, tzinfo=timezone.utc)
 
@@ -620,7 +641,7 @@ class TestEdgeCases:
             query_text="Apple",
             query_timestamp=future_date,
             beta=0.5,
-            top_k_final=5,  # noqa: E501
+            top_k_final=5,
         )
 
         # Should return results (all documents are "in the past")
@@ -628,7 +649,7 @@ class TestEdgeCases:
 
     def test_past_query_timestamp(
         self, retriever: TemporalSpinRetriever
-    ) -> None:  # noqa: E501
+    ) -> None:
         """Query with very old timestamp should work."""
         old_date = datetime(2010, 1, 1, tzinfo=timezone.utc)
 
@@ -636,15 +657,15 @@ class TestEdgeCases:
             query_text="Apple",
             query_timestamp=old_date,
             beta=0.5,
-            top_k_final=5,  # noqa: E501
+            top_k_final=5,
         )
 
         assert len(results) > 0
 
     def test_top_k_larger_than_corpus(
         self, retriever: TemporalSpinRetriever
-    ) -> None:  # noqa: E501
-        """Requesting more results than documents should return all."""
+    ) -> None:
+        """Requesting more results than documents returns all."""
         results = retriever.search(
             query_text="Apple",
             query_timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc),
@@ -668,9 +689,9 @@ class TestEdgeCases:
         assert len(results) == 0
 
 
-# ============================================================================
+# ========================================================================
 # Tests for Search with Beta Sweep
-# ============================================================================
+# ========================================================================
 
 
 class TestBetaSweep:
@@ -699,7 +720,7 @@ class TestBetaSweep:
     def test_beta_sweep_shows_progression(
         self, retriever: TemporalSpinRetriever
     ) -> None:
-        """Beta sweep should show progression from semantic to temporal."""
+        """Beta sweep shows progression from semantic to temporal."""
         beta_values = [0.0, 0.5, 1.0]
         query_date = datetime(2020, 1, 1, tzinfo=timezone.utc)
 
@@ -711,15 +732,17 @@ class TestBetaSweep:
         )
 
         # Extract top result from each beta
-        top_results = [(beta, results[0]) for beta, results in sweep_results if results]
+        top_results = [
+            (beta, results[0]) for beta, results in sweep_results if results
+        ]
 
         # Verify we got results for each beta
         assert len(top_results) == len(beta_values)
 
 
-# ============================================================================
+# ========================================================================
 # Tests for Result Explanation
-# ============================================================================
+# ========================================================================
 
 
 class TestResultExplanation:
