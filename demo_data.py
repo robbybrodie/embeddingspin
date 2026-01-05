@@ -47,8 +47,10 @@ def generate_ibm_reports() -> List[Tuple[str, datetime]]:
     reports = []
     
     for year, revenue, net_income, strategic_focus in financial_data:
-        # Create timestamp (December 31 of each year)
-        timestamp = datetime(year, 12, 31, tzinfo=timezone.utc)
+        # Create start timestamp (January 1 of each year)
+        timestamp = datetime(year, 1, 1, tzinfo=timezone.utc)
+        # Create end_timestamp (December 31 of each year)
+        end_timestamp = datetime(year, 12, 31, tzinfo=timezone.utc)
         
         # Calculate growth rates
         prev_revenue = financial_data[financial_data.index((year, revenue, net_income, strategic_focus)) - 1][1] if year > 2015 else revenue
@@ -103,7 +105,7 @@ through continued focus on high-value segments and emerging technologies.
 For more information, visit ibm.com/investor or contact IBM Investor Relations.
 """.strip()
         
-        reports.append((text, timestamp))
+        reports.append((text, timestamp, end_timestamp))
     
     return reports
 
