@@ -85,7 +85,7 @@ def compute_spin_vector(
     
     Multi-scale encoding with 3 hierarchical periods (powers of 2):
     - Quarter scale (1 year): For quarterly precision within a year
-    - Decade scale (16 years): For year-to-year discrimination  
+    - Decade scale (16 years): For year-to-year discrimination
     - Century scale (256 years): For historical context
     
     Supports two modes (both return 9D vectors for consistent dimensionality):
@@ -208,7 +208,7 @@ def angular_difference(phi1: float, phi2: float) -> float:
     return min(diff, math.tau - diff)
 
 
-def arc_overlap(phi_start1: float, phi_end1: float, 
+def arc_overlap(phi_start1: float, phi_end1: float,
                 phi_start2: float, phi_end2: float) -> float:
     """
     Compute the overlap (intersection) between two arcs on the unit circle.
@@ -229,28 +229,63 @@ def arc_overlap(phi_start1: float, phi_end1: float,
         >>> overlap = arc_overlap(q1_start, q1_end, q2_start, q2_end)
         >>> # Returns 0.0 (adjacent, no overlap)
     """
+    # Calculate arc lengths before normalization to handle full circles
+    raw_len1 = phi_end1 - phi_start1
+    raw_len2 = phi_end2 - phi_start2
+    
     # Normalize all angles to [0, 2π)
     phi_start1 = phi_start1 % math.tau
     phi_end1 = phi_end1 % math.tau
     phi_start2 = phi_start2 % math.tau
     phi_end2 = phi_end2 % math.tau
     
-    # Handle wrapping for arc 1
-    if phi_end1 < phi_start1:
-        phi_end1 += math.tau
-    
-    # Handle wrapping for arc 2
-    if phi_end2 < phi_start2:
-        phi_end2 += math.tau
-    
-    # Find intersection
-    intersection_start = max(phi_start1, phi_start2)
-    intersection_end = min(phi_end1, phi_end2)
-    
-    if intersection_end > intersection_start:
-        return intersection_end - intersection_start
+    # Calculate arc lengths (use raw if >= tau for full circles)
+    if abs(raw_len1) >= math.tau:
+        len1 = math.tau
     else:
-        return 0.0
+        len1 = (phi_end1 - phi_start1) % math.tau
+    
+    if abs(raw_len2) >= math.tau:
+        len2 = math.tau
+    else:
+        len2 = (phi_end2 - phi_start2) % math.tau
+    
+    # Check if arc1 contains arc2's start or if arc2 contains arc1's start
+    # This handles wrapping cases
+    def point_in_arc(point: float, arc_start: float, arc_length: float) -> bool:  # noqa: E501
+        """Check if a point is inside an arc (handling wrapping)."""
+        diff = (point - arc_start) % math.tau
+        return diff <= arc_length
+    
+    # If either arc is nearly a full circle, use special case
+    if len1 > math.tau - 1e-10 or len2 > math.tau - 1e-10:
+        return min(len1, len2)
+    
+    # Check various overlap scenarios
+    # Case 1: arc2_start is in arc1
+    if point_in_arc(phi_start2, phi_start1, len1):
+        # arc2 starts inside arc1
+        if point_in_arc(phi_end2, phi_start1, len1):
+            # arc2 is completely inside arc1
+            return len2
+        else:
+            # arc2 extends beyond arc1
+            overlap_end = (phi_start1 + len1) % math.tau
+            return (overlap_end - phi_start2) % math.tau
+    
+    # Case 2: arc1_start is in arc2
+    if point_in_arc(phi_start1, phi_start2, len2):
+        # arc1 starts inside arc2
+        if point_in_arc(phi_end1, phi_start2, len2):
+            # arc1 is completely inside arc2
+            return len1
+        else:
+            # arc1 extends beyond arc2
+            overlap_end = (phi_start2 + len2) % math.tau
+            return (overlap_end - phi_start1) % math.tau
+    
+    # No overlap
+    return 0.0
 
 
 def jaccard_similarity_arcs(phi_start1: float, phi_end1: float,
