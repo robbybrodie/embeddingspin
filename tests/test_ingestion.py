@@ -11,9 +11,9 @@ Tests the ingestion pipeline:
 - Metadata handling
 """
 
-import sys
 import os
-from datetime import datetime, timezone, timedelta
+import sys
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 import pytest
@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 # Tests for Single Document Ingestion
 # ============================================================================
 
+
 class TestSingleDocumentIngestion:
     """Test ingestion of individual documents."""
 
@@ -43,9 +44,7 @@ class TestSingleDocumentIngestion:
         timestamp = datetime(2020, 1, 1, tzinfo=timezone.utc)
 
         doc = ingestion_pipeline.ingest_document(
-            text=text,
-            timestamp=timestamp,
-            doc_id="test_doc_1"
+            text=text, timestamp=timestamp, doc_id="test_doc_1"
         )
 
         assert doc is not None
@@ -63,8 +62,7 @@ class TestSingleDocumentIngestion:
         text = "For the period ended 31 December 2019, revenue increased."
 
         doc = ingestion_pipeline.ingest_document(
-            text=text,
-            doc_id="test_doc_2"
+            text=text, doc_id="test_doc_2"
         )
 
         assert doc is not None
@@ -79,8 +77,7 @@ class TestSingleDocumentIngestion:
         timestamp = datetime(2020, 1, 1, tzinfo=timezone.utc)
 
         doc = ingestion_pipeline.ingest_document(
-            text=text,
-            timestamp=timestamp
+            text=text, timestamp=timestamp
         )
 
         assert doc.doc_id is not None
@@ -95,9 +92,7 @@ class TestSingleDocumentIngestion:
         metadata = {"category": "tech", "author": "John Doe"}
 
         doc = ingestion_pipeline.ingest_document(
-            text=text,
-            timestamp=timestamp,
-            metadata=metadata
+            text=text, timestamp=timestamp, metadata=metadata
         )
 
         assert doc.metadata == metadata
@@ -110,8 +105,7 @@ class TestSingleDocumentIngestion:
         timestamp = datetime(2020, 1, 1, tzinfo=timezone.utc)
 
         doc = ingestion_pipeline.ingest_document(
-            text=text,
-            timestamp=timestamp
+            text=text, timestamp=timestamp
         )
 
         # Point mode: no end_timestamp
@@ -132,9 +126,7 @@ class TestSingleDocumentIngestion:
         end = datetime(2020, 3, 31, tzinfo=timezone.utc)
 
         doc = ingestion_pipeline.ingest_document(
-            text=text,
-            timestamp=start,
-            end_timestamp=end
+            text=text, timestamp=start, end_timestamp=end
         )
 
         # Arc mode: end_timestamp provided
@@ -149,7 +141,7 @@ class TestSingleDocumentIngestion:
     def test_ingest_document_added_to_vector_store(
         self,
         ingestion_pipeline: "TemporalSpinIngestionPipeline",
-        empty_vector_store: "InMemoryVectorStore"
+        empty_vector_store: "InMemoryVectorStore",
     ) -> None:
         """Ingested document should be added to vector store."""
         initial_count = empty_vector_store.count()
@@ -157,7 +149,7 @@ class TestSingleDocumentIngestion:
         ingestion_pipeline.ingest_document(
             text="Test document",
             timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc),
-            doc_id="test_doc"
+            doc_id="test_doc",
         )
 
         final_count = empty_vector_store.count()
@@ -173,31 +165,30 @@ class TestSingleDocumentIngestion:
 # Tests for Batch Ingestion
 # ============================================================================
 
+
 class TestBatchIngestion:
     """Test batch ingestion of multiple documents."""
 
     def test_ingest_batch_multiple_documents(
         self,
         ingestion_pipeline: "TemporalSpinIngestionPipeline",
-        empty_vector_store: "InMemoryVectorStore"
+        empty_vector_store: "InMemoryVectorStore",
     ) -> None:
         """Should ingest multiple documents in batch."""
         texts = [
             "Document 1 about technology",
             "Document 2 about finance",
-            "Document 3 about healthcare"
+            "Document 3 about healthcare",
         ]
         timestamps = [
             datetime(2020, 1, 1, tzinfo=timezone.utc),
             datetime(2020, 2, 1, tzinfo=timezone.utc),
-            datetime(2020, 3, 1, tzinfo=timezone.utc)
+            datetime(2020, 3, 1, tzinfo=timezone.utc),
         ]
         doc_ids = ["doc_1", "doc_2", "doc_3"]
 
         docs = ingestion_pipeline.ingest_batch(
-            texts=texts,
-            timestamps=timestamps,
-            doc_ids=doc_ids
+            texts=texts, timestamps=timestamps, doc_ids=doc_ids
         )
 
         assert len(docs) == 3
@@ -213,7 +204,7 @@ class TestBatchIngestion:
     def test_ingest_batch_with_arc_mode(
         self,
         ingestion_pipeline: "TemporalSpinIngestionPipeline",
-        empty_vector_store: "InMemoryVectorStore"
+        empty_vector_store: "InMemoryVectorStore",
     ) -> None:
         """Should ingest batch with arc-encoded documents."""
         reports = get_quarterly_reports()
@@ -227,7 +218,7 @@ class TestBatchIngestion:
             texts=texts,
             timestamps=starts,
             end_timestamps=ends,  # type: ignore[arg-type]
-            metadatas=metadatas
+            metadatas=metadatas,
         )
 
         assert len(docs) == len(reports)
@@ -245,17 +236,15 @@ class TestBatchIngestion:
         texts = ["Point doc", "Arc doc"]
         timestamps = [
             datetime(2020, 1, 1, tzinfo=timezone.utc),
-            datetime(2020, 1, 1, tzinfo=timezone.utc)
+            datetime(2020, 1, 1, tzinfo=timezone.utc),
         ]
         end_timestamps: list[datetime | None] = [
             None,  # Point mode
-            datetime(2020, 3, 31, tzinfo=timezone.utc)  # Arc mode
+            datetime(2020, 3, 31, tzinfo=timezone.utc),  # Arc mode
         ]
 
         docs = ingestion_pipeline.ingest_batch(
-            texts=texts,
-            timestamps=timestamps,
-            end_timestamps=end_timestamps
+            texts=texts, timestamps=timestamps, end_timestamps=end_timestamps
         )
 
         assert len(docs) == 2
@@ -270,8 +259,7 @@ class TestBatchIngestion:
         timestamps = [datetime(2020, 1, 1, tzinfo=timezone.utc)] * 3
 
         docs = ingestion_pipeline.ingest_batch(
-            texts=texts,
-            timestamps=timestamps
+            texts=texts, timestamps=timestamps
         )
 
         assert len(docs) == 3
@@ -287,13 +275,15 @@ class TestBatchIngestion:
         texts = ["Doc 1", "Doc 2", "Doc 3"]
         timestamps = [datetime(2020, 1, 1, tzinfo=timezone.utc)] * 3
         doc_ids: list[str | None] = [
-            "explicit_id", None, None
+            "explicit_id",
+            None,
+            None,
         ]  # Only first has ID
 
         docs = ingestion_pipeline.ingest_batch(
             texts=texts,
             timestamps=timestamps,
-            doc_ids=doc_ids  # type: ignore[arg-type]
+            doc_ids=doc_ids,  # type: ignore[arg-type]
         )
 
         assert docs[0].doc_id == "explicit_id"
@@ -306,13 +296,12 @@ class TestBatchIngestion:
         """Should extract timestamps from text when not provided."""
         texts = [
             "For fiscal year 2020, revenue was $100M",
-            "For fiscal year 2021, revenue was $150M"
+            "For fiscal year 2021, revenue was $150M",
         ]
 
         timestamps_list: list[datetime | None] = [None, None]
         docs = ingestion_pipeline.ingest_batch(
-            texts=texts,
-            timestamps=timestamps_list  # type: ignore[arg-type]
+            texts=texts, timestamps=timestamps_list  # type: ignore[arg-type]
         )
 
         assert docs[0].timestamp.year == 2020
@@ -323,21 +312,23 @@ class TestBatchIngestion:
 # Tests for Embedding Generation
 # ============================================================================
 
+
 class TestEmbeddingGeneration:
     """Test embedding generation and concatenation."""
 
     def test_semantic_embedding_dimension(
         self,
         ingestion_pipeline: "TemporalSpinIngestionPipeline",
-        mock_embedding_client: object
+        mock_embedding_client: object,
     ) -> None:
         """Semantic embedding should match client dimension."""
         doc = ingestion_pipeline.ingest_document(
             text="Test document",
-            timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc)
+            timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc),
         )
 
         from typing import cast
+
         expected_dim: int = cast(
             int, mock_embedding_client.dimension  # type: ignore[attr-defined]
         )
@@ -348,15 +339,16 @@ class TestEmbeddingGeneration:
     def test_full_embedding_concatenation(
         self,
         ingestion_pipeline: "TemporalSpinIngestionPipeline",
-        mock_embedding_client: object
+        mock_embedding_client: object,
     ) -> None:
         """Full embedding should be semantic + spin (9D)."""
         doc = ingestion_pipeline.ingest_document(
             text="Test document",
-            timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc)
+            timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc),
         )
 
         from typing import cast
+
         semantic_dim: int = cast(
             int, mock_embedding_client.dimension  # type: ignore[attr-defined]
         )
@@ -375,12 +367,12 @@ class TestEmbeddingGeneration:
         """Different texts should produce different semantic embeddings."""
         doc1 = ingestion_pipeline.ingest_document(
             text="Apple announces new iPhone",
-            timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc)
+            timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc),
         )
 
         doc2 = ingestion_pipeline.ingest_document(
             text="Microsoft releases Windows update",
-            timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc)
+            timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc),
         )
 
         # Semantic embeddings should differ (mock client uses simple hash)
@@ -390,6 +382,7 @@ class TestEmbeddingGeneration:
 # ============================================================================
 # Tests for Timestamp Handling
 # ============================================================================
+
 
 class TestTimestampHandling:
     """Test various timestamp handling scenarios."""
@@ -401,8 +394,7 @@ class TestTimestampHandling:
         timestamp_naive = datetime(2020, 1, 1)  # No timezone
 
         doc = ingestion_pipeline.ingest_document(
-            text="Test",
-            timestamp=timestamp_naive
+            text="Test", timestamp=timestamp_naive
         )
 
         assert doc.timestamp.tzinfo is not None
@@ -414,12 +406,12 @@ class TestTimestampHandling:
         """Non-UTC timestamps should be converted to UTC."""
         # Create EST timestamp (UTC-5)
         from datetime import timezone as tz
+
         est = tz(timedelta(hours=-5))
         timestamp_est = datetime(2020, 1, 1, 12, 0, 0, tzinfo=est)
 
         doc = ingestion_pipeline.ingest_document(
-            text="Test",
-            timestamp=timestamp_est
+            text="Test", timestamp=timestamp_est
         )
 
         # Should be stored in UTC
@@ -434,8 +426,7 @@ class TestTimestampHandling:
         future_date = datetime(2030, 1, 1, tzinfo=timezone.utc)
 
         doc = ingestion_pipeline.ingest_document(
-            text="Test",
-            timestamp=future_date
+            text="Test", timestamp=future_date
         )
 
         assert doc.timestamp == future_date
@@ -447,8 +438,7 @@ class TestTimestampHandling:
         old_date = datetime(1990, 1, 1, tzinfo=timezone.utc)
 
         doc = ingestion_pipeline.ingest_document(
-            text="Test",
-            timestamp=old_date
+            text="Test", timestamp=old_date
         )
 
         assert doc.timestamp == old_date
@@ -458,6 +448,7 @@ class TestTimestampHandling:
 # Tests for Metadata Handling
 # ============================================================================
 
+
 class TestMetadataHandling:
     """Test metadata storage and retrieval."""
 
@@ -466,17 +457,18 @@ class TestMetadataHandling:
     ) -> None:
         """Metadata should be preserved in SpinDocument."""
         from typing import Any
+
         metadata: dict[str, Any] = {
             "author": "John Doe",
             "category": "technology",
             "tags": ["AI", "ML", "deep learning"],
-            "priority": 5
+            "priority": 5,
         }
 
         doc = ingestion_pipeline.ingest_document(
             text="Test",
             timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc),
-            metadata=metadata
+            metadata=metadata,
         )
 
         assert doc.metadata == metadata
@@ -486,17 +478,18 @@ class TestMetadataHandling:
     def test_metadata_preserved_in_vector_store(
         self,
         ingestion_pipeline: "TemporalSpinIngestionPipeline",
-        empty_vector_store: "InMemoryVectorStore"
+        empty_vector_store: "InMemoryVectorStore",
     ) -> None:
         """Metadata should be retrievable from vector store."""
         from typing import Any
+
         metadata: dict[str, Any] = {"company": "Apple", "quarter": "Q1"}
 
         ingestion_pipeline.ingest_document(
             text="Test",
             timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc),
             doc_id="test_metadata",
-            metadata=metadata
+            metadata=metadata,
         )
 
         retrieved = empty_vector_store.get_document("test_metadata")
@@ -508,16 +501,17 @@ class TestMetadataHandling:
     ) -> None:
         """Batch ingestion should preserve metadata for each document."""
         from typing import Any
+
         metadatas: list[dict[str, Any]] = [
             {"id": 1, "type": "report"},
             {"id": 2, "type": "article"},
-            {"id": 3, "type": "memo"}
+            {"id": 3, "type": "memo"},
         ]
 
         docs = ingestion_pipeline.ingest_batch(
             texts=["Doc 1", "Doc 2", "Doc 3"],
             timestamps=[datetime(2020, 1, 1, tzinfo=timezone.utc)] * 3,
-            metadatas=metadatas
+            metadatas=metadatas,
         )
 
         for i, doc in enumerate(docs):
@@ -528,6 +522,7 @@ class TestMetadataHandling:
 # Tests for Error Handling
 # ============================================================================
 
+
 class TestErrorHandling:
     """Test error handling in ingestion pipeline."""
 
@@ -536,8 +531,7 @@ class TestErrorHandling:
     ) -> None:
         """Empty text should be handled gracefully."""
         doc = ingestion_pipeline.ingest_document(
-            text="",
-            timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc)
+            text="", timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc)
         )
 
         assert doc is not None
@@ -550,8 +544,7 @@ class TestErrorHandling:
         long_text = "A" * 10000
 
         doc = ingestion_pipeline.ingest_document(
-            text=long_text,
-            timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc)
+            text=long_text, timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc)
         )
 
         assert doc is not None
@@ -564,8 +557,7 @@ class TestErrorHandling:
         text = "Test with émojis 🚀 and spëcial çharacters!"
 
         doc = ingestion_pipeline.ingest_document(
-            text=text,
-            timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc)
+            text=text, timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc)
         )
 
         assert doc.text == text
@@ -573,7 +565,7 @@ class TestErrorHandling:
     def test_duplicate_doc_id_overwritten(
         self,
         ingestion_pipeline: "TemporalSpinIngestionPipeline",
-        empty_vector_store: "InMemoryVectorStore"
+        empty_vector_store: "InMemoryVectorStore",
     ) -> None:
         """Duplicate doc_id should overwrite previous document."""
         doc_id = "duplicate_test"
@@ -582,14 +574,14 @@ class TestErrorHandling:
         _doc1 = ingestion_pipeline.ingest_document(  # noqa: F841
             text="First version",
             timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc),
-            doc_id=doc_id
+            doc_id=doc_id,
         )
 
         # Second ingestion with same ID
         ingestion_pipeline.ingest_document(
             text="Second version",
             timestamp=datetime(2020, 2, 1, tzinfo=timezone.utc),
-            doc_id=doc_id
+            doc_id=doc_id,
         )
 
         # Should be overwritten
@@ -601,6 +593,7 @@ class TestErrorHandling:
 # ============================================================================
 # Tests for Arc Period Validation
 # ============================================================================
+
 
 class TestArcPeriodValidation:
     """Test validation of arc periods."""
@@ -616,9 +609,7 @@ class TestArcPeriodValidation:
         # At minimum, should not crash
         try:
             _doc = ingestion_pipeline.ingest_document(  # noqa: F841
-                text="Invalid arc",
-                timestamp=start,
-                end_timestamp=end
+                text="Invalid arc", timestamp=start, end_timestamp=end
             )
             # If accepted, end should be after start in normalized form
             # or arc should handle wrapping
@@ -636,7 +627,7 @@ class TestArcPeriodValidation:
         doc = ingestion_pipeline.ingest_document(
             text="Zero-length arc",
             timestamp=timestamp,
-            end_timestamp=timestamp
+            end_timestamp=timestamp,
         )
 
         # Should produce arc with zero length
@@ -652,9 +643,7 @@ class TestArcPeriodValidation:
         end = datetime(2025, 12, 31, tzinfo=timezone.utc)  # 15+ years
 
         doc = ingestion_pipeline.ingest_document(
-            text="Multi-year period",
-            timestamp=start,
-            end_timestamp=end
+            text="Multi-year period", timestamp=start, end_timestamp=end
         )
 
         assert doc.is_arc is True

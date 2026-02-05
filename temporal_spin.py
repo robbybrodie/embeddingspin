@@ -30,11 +30,11 @@ Temporal Zoom:
 
 import math
 import re
-from datetime import datetime, timezone
-from typing import List, Tuple, Optional, Dict, Any
 from dataclasses import dataclass
-from dateutil import parser as dateutil_parser
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
+from dateutil import parser as dateutil_parser
 
 # ============================================================================
 # Configuration Constants
@@ -61,7 +61,7 @@ CENTURY_PERIOD_SECONDS = CENTURY_SCALE_YEARS * 365.25 * 24 * 3600
 # Weights for multi-scale temporal alignment
 # Decade scale gets highest weight for year-to-year queries
 QUARTER_WEIGHT = 0.4  # Within-year precision
-DECADE_WEIGHT = 0.5   # Year discrimination (highest)
+DECADE_WEIGHT = 0.5  # Year discrimination (highest)
 CENTURY_WEIGHT = 0.1  # Historical context
 
 # Default embedding dimension (adjust based on your model)
@@ -72,26 +72,32 @@ DEFAULT_EMBEDDING_DIM = 384
 # Temporal Spin Encoding (Point and Arc)
 # ============================================================================
 
+
 def compute_spin_vector(
     timestamp_seconds: float,
     t0_seconds: float = T0_SECONDS,
     period_seconds: float = None,  # Deprecated - now uses multi-scale
     phase_offset: float = 0.0,
     temporal_scale: float = 1.0,
-    end_timestamp_seconds: Optional[float] = None
-) -> Tuple[List[float], Dict[str, float], Dict[str, Optional[float]], Dict[str, Optional[float]]]:
+    end_timestamp_seconds: Optional[float] = None,
+) -> Tuple[
+    List[float],
+    Dict[str, float],
+    Dict[str, Optional[float]],
+    Dict[str, Optional[float]],
+]:
     """
     Map a timestamp (or time interval) to a multi-scale temporal spin vector.
-    
+
     Multi-scale encoding with 3 hierarchical periods (powers of 2):
     - Quarter scale (1 year): For quarterly precision within a year
-    - Decade scale (16 years): For year-to-year discrimination  
+    - Decade scale (16 years): For year-to-year discrimination
     - Century scale (256 years): For historical context
-    
+
     Supports two modes (both return 9D vectors for consistent dimensionality):
     1. Point mode: Single timestamp → 9D vector [x_q, y_q, 0, x_d, y_d, 0, x_c, y_c, 0]
     2. Arc mode: Time period → 9D vector with arc_length in z components
-    
+
     Args:
         timestamp_seconds: Unix timestamp in seconds (start time for arcs)
         t0_seconds: Base epoch timestamp (default: 2010-01-01)
@@ -99,21 +105,21 @@ def compute_spin_vector(
         phase_offset: Optional phase shift in radians
         temporal_scale: Scaling factor for spin vector magnitude (default: 1.0)
         end_timestamp_seconds: Optional end timestamp for arc mode. If None, uses point mode.
-    
+
     Returns:
         Tuple of (spin_vector, phi_centers, phi_starts, phi_ends):
         - spin_vector: Always 9D [x_q, y_q, z_q, x_d, y_d, z_d, x_c, y_c, z_c]
         - phi_centers: Dict with keys 'quarter', 'decade', 'century'
         - phi_starts: Dict with start angles for each scale (None for points)
         - phi_ends: Dict with end angles for each scale (None for points)
-    
+
     Examples:
         >>> # Point mode - single instant in time
         >>> t = datetime(2023, 6, 15, tzinfo=timezone.utc).timestamp()
         >>> spin, phi_c, phi_s, phi_e = compute_spin_vector(t)
         >>> len(spin)  # Returns 9
         9
-        
+
         >>> # Arc mode - Q1 2023 (period)
         >>> t_start = datetime(2023, 1, 1, tzinfo=timezone.utc).timestamp()
         >>> t_end = datetime(2023, 3, 31, tzinfo=timezone.utc).timestamp()
@@ -121,86 +127,94 @@ def compute_spin_vector(
         >>> # Quarter scale will show ~90° arc, decade/century scales show smaller arcs
     """
     periods = {
-        'quarter': QUARTER_PERIOD_SECONDS,
-        'decade': DECADE_PERIOD_SECONDS,
-        'century': CENTURY_PERIOD_SECONDS
+        "quarter": QUARTER_PERIOD_SECONDS,
+        "decade": DECADE_PERIOD_SECONDS,
+        "century": CENTURY_PERIOD_SECONDS,
     }
-    
+
     spin_vector = []
     phi_centers = {}
     phi_starts = {}
     phi_ends = {}
-    
+
     # Encode at each scale
-    for scale_name in ['quarter', 'decade', 'century']:
+    for scale_name in ["quarter", "decade", "century"]:
         period_sec = periods[scale_name]
-        
+
         # Point mode: Single timestamp
         if end_timestamp_seconds is None:
             # Normalize time to [0, 1) fractional position within period
             fraction = ((timestamp_seconds - t0_seconds) / period_sec) % 1.0
-            
+
             # Convert to angle: φ ∈ [0, 2π)
             phi = math.tau * fraction + phase_offset
-            
+
             # Spin vector on unit circle (3D with arc_length=0 for points)
             cos_phi = math.cos(phi)
             sin_phi = math.sin(phi)
-            spin_vector.extend([
-                temporal_scale * cos_phi,
-                temporal_scale * sin_phi,
-                0.0  # No arc length for points
-            ])
-            
+            spin_vector.extend(
+                [
+                    temporal_scale * cos_phi,
+                    temporal_scale * sin_phi,
+                    0.0,  # No arc length for points
+                ]
+            )
+
             phi_centers[scale_name] = phi
             phi_starts[scale_name] = None
             phi_ends[scale_name] = None
-        
+
         # Arc mode: Start and end timestamps
         else:
             # Compute start and end angles at this scale
-            fraction_start = ((timestamp_seconds - t0_seconds) / period_sec) % 1.0
-            fraction_end = ((end_timestamp_seconds - t0_seconds) / period_sec) % 1.0
-            
+            fraction_start = (
+                (timestamp_seconds - t0_seconds) / period_sec
+            ) % 1.0
+            fraction_end = (
+                (end_timestamp_seconds - t0_seconds) / period_sec
+            ) % 1.0
+
             phi_start = math.tau * fraction_start + phase_offset
             phi_end = math.tau * fraction_end + phase_offset
-            
+
             # Handle wrapping: if end < start, arc crosses 0°
             if phi_end < phi_start:
                 phi_end += math.tau
-            
+
             # Compute arc center and length
             phi_center = (phi_start + phi_end) / 2.0
             arc_length = phi_end - phi_start
-            
+
             # Normalize phi_center back to [0, 2π)
             phi_center = phi_center % math.tau
-            
+
             # Spin vector for arcs (3D: center + arc_length)
             cos_center = math.cos(phi_center)
             sin_center = math.sin(phi_center)
-            spin_vector.extend([
-                temporal_scale * cos_center,
-                temporal_scale * sin_center,
-                arc_length  # Arc length in radians (not scaled)
-            ])
-            
+            spin_vector.extend(
+                [
+                    temporal_scale * cos_center,
+                    temporal_scale * sin_center,
+                    arc_length,  # Arc length in radians (not scaled)
+                ]
+            )
+
             phi_centers[scale_name] = phi_center
             phi_starts[scale_name] = phi_start
             phi_ends[scale_name] = phi_end
-    
+
     return spin_vector, phi_centers, phi_starts, phi_ends
 
 
 def angular_difference(phi1: float, phi2: float) -> float:
     """
     Compute the smallest angular difference between two angles.
-    
+
     Returns Δφ ∈ [0, π] (always the shortest arc on the circle).
-    
+
     Args:
         phi1, phi2: Angles in radians
-    
+
     Returns:
         Smallest angular distance in radians
     """
@@ -224,20 +238,22 @@ def _normalize_phi_interval(phi_start, phi_end):
         phi_end += tau
     return phi_start, phi_end
 
-def arc_overlap(phi_start1: float, phi_end1: float, 
-                phi_start2: float, phi_end2: float) -> float:
+
+def arc_overlap(
+    phi_start1: float, phi_end1: float, phi_start2: float, phi_end2: float
+) -> float:
     """
     Compute the overlap (intersection) between two arcs on the unit circle.
-    
+
     Arcs are defined by [phi_start, phi_end]. This function handles wrapping.
-    
+
     Args:
         phi_start1, phi_end1: First arc (start and end angles in radians)
         phi_start2, phi_end2: Second arc
-    
+
     Returns:
         Overlap length in radians [0, 2π]
-    
+
     Example:
         >>> # Two arcs covering Q1 and Q2 of a year
         >>> q1_start, q1_end = 0.0, math.pi/2
@@ -245,14 +261,26 @@ def arc_overlap(phi_start1: float, phi_end1: float,
         >>> overlap = arc_overlap(q1_start, q1_end, q2_start, q2_end)
         >>> # Returns 0.0 (adjacent, no overlap)
     """
-    # Normalize both intervals
+    tau = math.tau
+
+    # Check for full circles BEFORE normalization
+    raw_len1 = phi_end1 - phi_start1
+    raw_len2 = phi_end2 - phi_start2
+
+    is_full1 = abs(raw_len1) >= tau - 1e-10
+    is_full2 = abs(raw_len2) >= tau - 1e-10
+
+    # If either is a full circle, return the min of the two arc lengths
+    if is_full1 and is_full2:
+        return tau
+    elif is_full1:
+        return min(tau, abs(raw_len2))
+    elif is_full2:
+        return min(tau, abs(raw_len1))
+
+    # Normalize both intervals for non-full-circle case
     phi_start1, phi_end1 = _normalize_phi_interval(phi_start1, phi_end1)
     phi_start2, phi_end2 = _normalize_phi_interval(phi_start2, phi_end2)
-
-    # If either interval is a full circle, overlap is full circle
-    tau = math.tau
-    if (phi_end1 - phi_start1) >= tau - 1e-10 or (phi_end2 - phi_start2) >= tau - 1e-10:
-        return tau
 
     # Robust circular interval overlap
     # Represent both intervals as (start, length)
@@ -282,20 +310,21 @@ def arc_overlap(phi_start1: float, phi_end1: float,
     return min(overlap, tau)
 
 
-def jaccard_similarity_arcs(phi_start1: float, phi_end1: float,
-                            phi_start2: float, phi_end2: float) -> float:
+def jaccard_similarity_arcs(
+    phi_start1: float, phi_end1: float, phi_start2: float, phi_end2: float
+) -> float:
     """
     Compute Jaccard similarity between two arcs on the unit circle.
-    
+
     Jaccard = |intersection| / |union|
-    
+
     Args:
         phi_start1, phi_end1: First arc
         phi_start2, phi_end2: Second arc
-    
+
     Returns:
         Jaccard similarity in [0, 1]
-    
+
     Example:
         >>> # Annual report (full year) vs Q2 (quarter)
         >>> year_start, year_end = 0.0, 2*math.pi
@@ -340,36 +369,35 @@ def jaccard_similarity_arcs(phi_start1: float, phi_end1: float,
 # Common date patterns in financial/corporate documents
 DATE_PATTERNS = [
     # "for the period ended 31 December 2019"
-    r'period\s+ended\s+(\d{1,2}\s+\w+\s+\d{4})',
+    r"period\s+ended\s+(\d{1,2}\s+\w+\s+\d{4})",
     # "as of December 31, 2019"
-    r'as\s+of\s+(\w+\s+\d{1,2},?\s+\d{4})',
+    r"as\s+of\s+(\w+\s+\d{1,2},?\s+\d{4})",
     # "fiscal year 2019"
-    r'fiscal\s+year\s+(\d{4})',
+    r"fiscal\s+year\s+(\d{4})",
     # "Q4 2019", "Q1 2020"
-    r'Q[1-4]\s+(\d{4})',
+    r"Q[1-4]\s+(\d{4})",
     # ISO format: "2019-12-31"
-    r'(\d{4}-\d{2}-\d{2})',
+    r"(\d{4}-\d{2}-\d{2})",
     # US format: "12/31/2019"
-    r'(\d{1,2}/\d{1,2}/\d{4})',
+    r"(\d{1,2}/\d{1,2}/\d{4})",
 ]
 
 
 def extract_timestamp_from_text(
-    text: str,
-    fallback: Optional[datetime] = None
+    text: str, fallback: Optional[datetime] = None
 ) -> datetime:
     """
     Extract timestamp from document text using regex patterns and dateutil.
-    
+
     Strategy:
     1. Try regex patterns for common corporate/financial date formats
     2. Use dateutil fuzzy parsing as fallback
     3. Use provided fallback or current time if all else fails
-    
+
     Args:
         text: Document text to parse
         fallback: Fallback datetime if extraction fails
-    
+
     Returns:
         Extracted datetime (timezone-aware UTC)
     """
@@ -387,7 +415,7 @@ def extract_timestamp_from_text(
                 return dt
             except (ValueError, TypeError):
                 continue
-    
+
     # Fallback: try fuzzy parsing on entire text (first 500 chars)
     try:
         dt = dateutil_parser.parse(text[:500], fuzzy=True)
@@ -396,7 +424,7 @@ def extract_timestamp_from_text(
         return dt
     except (ValueError, TypeError):
         pass
-    
+
     # Final fallback
     if fallback:
         return fallback
@@ -407,11 +435,12 @@ def extract_timestamp_from_text(
 # Document and Query Representations
 # ============================================================================
 
+
 @dataclass
 class SpinDocument:
     """
     A document with multi-scale temporal-phase spin encoding (point or arc mode).
-    
+
     Attributes:
         doc_id: Unique identifier
         text: Original document text
@@ -427,6 +456,7 @@ class SpinDocument:
         phi_end: Dict with end angles for each scale (None values for points)
         is_arc: True if this is an arc (time period), False if point (instant)
     """
+
     doc_id: str
     text: str
     timestamp: datetime
@@ -439,7 +469,7 @@ class SpinDocument:
     phi_start: Optional[Dict[str, Optional[float]]] = None
     phi_end: Optional[Dict[str, Optional[float]]] = None
     is_arc: bool = False
-    
+
     def __post_init__(self):
         if self.metadata is None:
             self.metadata = {}
@@ -452,7 +482,7 @@ class SpinDocument:
 class SpinQuery:
     """
     A query with multi-scale temporal-phase spin encoding (point or arc mode).
-    
+
     Attributes:
         query_text: Query string
         query_timestamp: Target timestamp for retrieval (start for arcs)
@@ -466,6 +496,7 @@ class SpinQuery:
         phi_end: Dict with end angles for each scale (None values for points)
         is_arc: True if querying a time period
     """
+
     query_text: str
     query_timestamp: datetime
     semantic_embedding: List[float]
@@ -477,7 +508,7 @@ class SpinQuery:
     phi_start: Optional[Dict[str, Optional[float]]] = None
     phi_end: Optional[Dict[str, Optional[float]]] = None
     is_arc: bool = False
-    
+
     def __post_init__(self):
         if self.full_embedding is None:
             # Weighted concatenation: [semantic + λ * spin]
@@ -490,6 +521,7 @@ class RetrievalResult:
     """
     A single retrieval result with scores and metadata.
     """
+
     doc_id: str
     text: str
     timestamp: datetime
@@ -501,7 +533,7 @@ class RetrievalResult:
     combined_score: float
     rank: int = 0
     metadata: Dict[str, Any] = None
-    
+
     def __post_init__(self):
         if self.metadata is None:
             self.metadata = {}
@@ -511,22 +543,23 @@ class RetrievalResult:
 # Embedding Utilities
 # ============================================================================
 
+
 def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
     """
     Compute cosine similarity between two vectors.
-    
+
     Returns value in [-1, 1], where 1 = identical direction.
     """
     if len(vec1) != len(vec2):
         raise ValueError("Vectors must have same dimension")
-    
+
     dot_product = sum(a * b for a, b in zip(vec1, vec2))
     norm1 = math.sqrt(sum(a * a for a in vec1))
     norm2 = math.sqrt(sum(b * b for b in vec2))
-    
+
     if norm1 == 0 or norm2 == 0:
         return 0.0
-    
+
     return dot_product / (norm1 * norm2)
 
 
@@ -536,4 +569,3 @@ def normalize_vector(vec: List[float]) -> List[float]:
     if norm == 0:
         return vec
     return [x / norm for x in vec]
-

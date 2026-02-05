@@ -6,7 +6,7 @@ Provides reusable fixtures for testing the temporal spin retrieval system.
 """
 
 import math
-import pytest
+import pytest  # type: ignore[import-not-found]
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Tuple
 

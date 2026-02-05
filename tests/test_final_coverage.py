@@ -19,9 +19,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ingestion import TemporalSpinIngestionPipeline  # noqa: E402
 from llamastack_client import MockEmbeddingClient  # noqa: E402
 from retrieval import TemporalSpinRetriever, format_results_table  # noqa: E402
+
 # fmt: off
-from temporal_spin import (SpinDocument, arc_overlap,  # noqa: E402
-                           extract_timestamp_from_text)
+from temporal_spin import (  # noqa: E402
+    SpinDocument,
+    arc_overlap,
+    extract_timestamp_from_text,
+)
 from vector_store import InMemoryVectorStore  # noqa: E402
 
 # fmt: on
@@ -705,6 +709,8 @@ class TestIngestionExceptions:
         self, tmp_path, mock_embedding_client
     ):
         """Test exception at lines 280-281 in ingest_from_files."""
+        from unittest.mock import patch
+
         from ingestion import TemporalSpinIngestionPipeline
 
         # Create test file with name that will cause extract failure
@@ -716,19 +722,19 @@ class TestIngestionExceptions:
             embedding_client=mock_embedding_client, vector_store=store
         )
 
-        # Monkey-patch extract_timestamp_from_text to raise exception
-        ing_module = sys.modules["ingestion"]
-
-        original_extract = ing_module.extract_timestamp_from_text
-
+        # Patch extract_timestamp_from_text in temporal_spin module
         def failing_extract(text, fallback=None):
             if "bad_filename" in text:
                 raise ValueError("Simulated extraction failure")
-            return original_extract(text, fallback)
+            # Return fallback if provided, otherwise current time
+            if fallback:
+                return fallback
+            return datetime.now(timezone.utc)
 
-        ing_module.extract_timestamp_from_text = failing_extract
-
-        try:
+        with patch(
+            "temporal_spin.extract_timestamp_from_text",
+            side_effect=failing_extract,
+        ):
             # Should catch exception at lines 280-281 and use mtime
             pipeline.ingest_from_files(
                 [str(test_file)], extract_timestamp_from_filename=True
@@ -736,9 +742,6 @@ class TestIngestionExceptions:
 
             # Should succeed with mtime fallback
             assert len(store.documents) > 0
-        finally:
-            # Restore original function
-            ing_module.extract_timestamp_from_text = original_extract
 
 
 # ========================================================================
