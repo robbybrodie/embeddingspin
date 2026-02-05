@@ -1,0 +1,4 @@
+# file: /Users/kpeacocke/code/embeddingspin/__init__.py
+# hypothesis_version: 6.148.8
+
+['1.0.0', 'ChromaVectorStore', 'InMemoryVectorStore', 'MockEmbeddingClient', 'PGVectorStore', 'RetrievalResult', 'Robert Brodie', 'SpinDocument', 'SpinQuery', 'VectorStore', 'angular_difference', 'compute_spin_vector', 'format_results_table']

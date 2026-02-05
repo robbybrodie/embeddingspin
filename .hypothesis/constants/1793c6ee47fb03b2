@@ -1,0 +1,4 @@
+# file: /Users/kpeacocke/code/embeddingspin/vector_store.py
+# hypothesis_version: 6.148.8
+
+[1.0, 2.0, 386, ',', '[', ']', 'description', 'distances', 'documents', 'embeddings', 'end_timestamp', 'ids', 'is_arc', 'metadatas', 'phi', 'phi_end', 'phi_start', 'spin_documents', 'spin_vector', 'timestamp', 'tolist']
