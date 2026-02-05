@@ -1,4 +1,0 @@
-# file: /Users/kpeacocke/code/embeddingspin/llamastack_client.py
-# hypothesis_version: 6.148.8
-
-[0.5, 30.0, 384, '/', 'Authorization', 'Content-Type', 'LLAMASTACK_API_KEY', 'LLAMASTACK_URL', 'application/json', 'data', 'embedding', 'embeddings', 'encoding_format', 'float', 'index', 'input', 'mock-embed', 'model', 'test', 'text-embedding-v1']

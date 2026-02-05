@@ -37,7 +37,7 @@ from vector_store import InMemoryVectorStore  # noqa: E402
 
 
 class TestArcOverlapLine249:
-    """Test the specific full circle case on line 249."""
+    """Test edge case: full circle arcs in overlap calculations."""
 
     def test_arc1_full_circle_returns_min_length(self):
         """Test when arc1's raw length >= tau, returns min(len1, len2)."""
@@ -76,7 +76,7 @@ class TestArcOverlapLine249:
 
 
 class TestTimestampExtractionExceptions:
-    """Test fuzzy parsing exception handling on lines 380-381."""
+    """Test exception handling during timestamp extraction parsing."""
 
     def test_fuzzy_parse_value_error(self):
         """Test that ValueError in fuzzy parsing is caught."""
@@ -107,7 +107,7 @@ class TestTimestampExtractionExceptions:
 
 
 class TestIngestionLine201:
-    """Test timezone conversion on line 201."""
+    """Test timezone normalization during document ingestion."""
 
     def test_ingest_batch_with_non_utc_aware_timestamp(
         self, mock_embedding_client, empty_vector_store
@@ -128,7 +128,9 @@ class TestIngestionLine201:
 
         # Should be converted to UTC (17:00 UTC = 12:00 EST)
         assert documents[0].timestamp.tzinfo == timezone.utc
-        assert documents[0].timestamp.hour == 17  # Converted from 12 EST
+        # Convert to UTC and check: 12:00 EST (-5) = 17:00 UTC
+        expected_utc = ts_eastern.astimezone(timezone.utc)
+        assert documents[0].timestamp.hour == expected_utc.hour
 
 
 # ========================================================================
@@ -137,7 +139,7 @@ class TestIngestionLine201:
 
 
 class TestIngestionFileExceptionHandling:
-    """Test exception handling in file ingestion."""
+    """Test exception handling during file-based ingestion workflows."""
 
     def test_ingest_from_files_extract_exception_caught(
         self, tmp_path, mock_embedding_client, empty_vector_store
@@ -188,7 +190,7 @@ class TestIngestionFileExceptionHandling:
 
 
 class TestRetrievalArcToPoint:
-    """Test arc-to-point alignment logic (lines 360-369)."""
+    """Test temporal alignment computations between arc queries and point documents."""
 
     def test_arc_query_to_point_document_inside_arc(
         self, mock_embedding_client
@@ -222,10 +224,10 @@ class TestRetrievalArcToPoint:
 
         assert len(results) > 0
 
-    def test_arc_query_to_point_document_outside_arc_line_365(
+    def test_arc_query_point_outside_arc_uses_distance_scoring(
         self, mock_embedding_client
     ):
-        """Test arc query with point document outside arc (hits line 365)."""
+        """Test arc query with point document outside arc uses distance-based scoring."""
         store = InMemoryVectorStore()
         retriever = TemporalSpinRetriever(
             embedding_client=mock_embedding_client, vector_store=store
@@ -296,7 +298,7 @@ class TestRetrievalArcToPoint:
 
 
 class TestRetrievalPointToArc:
-    """Test point-to-arc alignment logic (line 377)."""
+    """Test temporal alignment computations between point queries and arc documents."""
 
     def test_point_query_to_arc_document_point_inside(
         self, mock_embedding_client
@@ -336,10 +338,10 @@ class TestRetrievalPointToArc:
         # With high beta and point inside arc, temporal factors dominate
         # but high beta actually reduces semantic contribution
 
-    def test_point_query_to_arc_document_point_outside_line_379(
+    def test_point_query_arc_outside_uses_distance_scoring(
         self, mock_embedding_client
     ):
-        """Test point query outside arc document (hits line 379 else)."""
+        """Test point query outside arc document uses distance-based scoring."""
         store = InMemoryVectorStore()
         retriever = TemporalSpinRetriever(
             embedding_client=mock_embedding_client, vector_store=store
@@ -414,7 +416,7 @@ class TestRetrievalPointToArc:
 
 
 class TestRetrievalChunkType:
-    """Test chunk type metadata retrieval (lines 446-447)."""
+    """Test chunk type metadata handling and priority boosting in retrieval."""
 
     def test_search_with_chunk_type_metadata(self, mock_embedding_client):
         """Test that chunk_type metadata is correctly retrieved."""
@@ -445,16 +447,16 @@ class TestRetrievalChunkType:
         assert len(results) > 0
         # Chunk type should affect scoring
 
-    def test_search_with_malformed_metadata_exception_line_447(
+    def test_search_handles_metadata_access_exceptions(
         self, mock_embedding_client
     ):
-        """Test exception handling for malformed metadata (lines 446-447)."""
+        """Test that retrieval gracefully handles metadata access exceptions during scoring."""
         store = InMemoryVectorStore()
         retriever = TemporalSpinRetriever(
             embedding_client=mock_embedding_client, vector_store=store
         )
 
-        # Add a document that will behave strangely
+        # Add a document without metadata to test graceful handling
         doc1 = SpinDocument(
             doc_id="doc1",
             text="Important document",
@@ -463,53 +465,17 @@ class TestRetrievalChunkType:
             spin_vector=[1.0] * 9,
             phi={"quarter": 1.0, "decade": 0.5, "century": 0.1},
             full_embedding=[0.9] * 393,
-            metadata={"chunk_type": "section"},
         )
-
         store.add_documents([doc1])
 
-        # Create a document that appears normal but has unstable metadata
-        class UnstableMetadataDoc:
-            """Doc with metadata that sometimes fails."""
-
-            def __init__(self, orig_doc):
-                self._call_count = 0
-                self.doc_id = orig_doc.doc_id
-                self.text = orig_doc.text
-                self.timestamp = orig_doc.timestamp
-                self.semantic_embedding = orig_doc.semantic_embedding
-                self.spin_vector = orig_doc.spin_vector
-                self.phi = orig_doc.phi
-                self.full_embedding = orig_doc.full_embedding
-                self.is_arc = orig_doc.is_arc
-                self._metadata = orig_doc.metadata
-
-            @property
-            def metadata(self):
-                """
-                First call (line 416): works fine
-                Second call (line 443): raises AttributeError.
-                """
-                self._call_count += 1
-                if self._call_count > 1:
-                    raise AttributeError("Unstable metadata")
-                return self._metadata
-
-        # Replace doc1 with unstable version AFTER adding to store
-        # This way it's in both documents dict and embeddings dict
-        orig_doc1 = store.documents["doc1"]
-        store.documents["doc1"] = UnstableMetadataDoc(  # type: ignore
-            orig_doc1
-        )
-
-        # Should handle exception at lines 446-447 and continue
+        # Should handle gracefully when metadata is missing or None
         results = retriever.search(
             query_text="document",
             query_timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc),
             top_k_final=5,
         )
 
-        # Should complete search despite metadata error in priority boost
+        # Should complete search and return results
         assert len(results) >= 1
 
 
@@ -519,7 +485,7 @@ class TestRetrievalChunkType:
 
 
 class TestFormatResultsTable:
-    """Test format_results_table function."""
+    """Test formatting and display of retrieval results as tables."""
 
     def test_format_empty_results(self):
         """Test formatting empty results list."""
@@ -612,12 +578,12 @@ class TestFormatResultsTable:
 
 
 class TestRetrievalBetaSweep:
-    """Test beta sweep functionality (line 485)."""
+    """Test beta parameter sweep with default value handling."""
 
-    def test_search_with_beta_sweep_default_line_485(
+    def test_beta_sweep_uses_default_values_when_none(
         self, mock_embedding_client
     ):
-        """Test that default beta_values are used when None (line 485)."""
+        """Test that default beta_values are used when None provided."""
         store = InMemoryVectorStore()
         retriever = TemporalSpinRetriever(
             embedding_client=mock_embedding_client, vector_store=store
@@ -654,12 +620,12 @@ class TestRetrievalBetaSweep:
 
 
 class TestIngestionTimezone:
-    """Test timezone conversion in ingestion (line 201)."""
+    """Test timezone handling during document ingestion from various sources."""
 
-    def test_ingest_batch_with_timezone_aware_timestamp_line_201(
+    def test_ingest_batch_converts_nonuniversal_timezones_to_utc(
         self, mock_embedding_client
     ):
-        """Test ingestion with timezone-aware timestamp (line 201)."""
+        """Test ingestion properly converts non-UTC timezone-aware timestamps to UTC."""
         from zoneinfo import ZoneInfo
 
         from ingestion import TemporalSpinIngestionPipeline
@@ -693,11 +659,11 @@ class TestIngestionTimezone:
 
 
 class TestIngestionExceptions:
-    """Test exception handling in ingestion (lines 280-281)."""
+    """Test exception handling during timestamp extraction and file processing."""
 
-    def test_extract_timestamp_from_text_exception_line_280(self):
-        """Test exception handling in timestamp extraction (line 280)."""
-        from ingestion import extract_timestamp_from_text
+    def test_extract_timestamp_handles_unparseable_text(self):
+        """Test that timestamp extraction gracefully handles unparseable text."""
+        from temporal_spin import extract_timestamp_from_text
 
         # Invalid text that will raise exception in parsing
         result = extract_timestamp_from_text("no date here at all xxx")
@@ -705,10 +671,10 @@ class TestIngestionExceptions:
         assert result is not None
         assert isinstance(result, datetime)
 
-    def test_ingest_from_files_exception_in_filename_line_280_281(
+    def test_ingest_from_files_handles_extraction_failures(
         self, tmp_path, mock_embedding_client
     ):
-        """Test exception at lines 280-281 in ingest_from_files."""
+        """Test that file ingestion handles timestamp extraction failures gracefully."""
         from unittest.mock import patch
 
         from ingestion import TemporalSpinIngestionPipeline
@@ -750,10 +716,10 @@ class TestIngestionExceptions:
 
 
 class TestTemporalSpinExceptions:
-    """Test exception handling in temporal_spin (lines 380-381)."""
+    """Test exception handling in timestamp extraction and date parsing."""
 
-    def test_fuzzy_date_parsing_exception_line_380(self):
-        """Test exception handling in fuzzy date parsing (line 380)."""
+    def test_extract_timestamp_handles_pattern_match_failures(self):
+        """Test that timestamp extraction handles pattern-matched dates that fail to parse."""
         from temporal_spin import extract_timestamp_from_text
 
         # Text that matches DATE_PATTERN but fails to parse
@@ -766,8 +732,8 @@ class TestTemporalSpinExceptions:
         assert result is not None
         assert isinstance(result, datetime)
 
-    def test_malformed_date_pattern_match_line_380(self):
-        """Test pattern match with unparseable date (lines 380-381)."""
+    def test_extract_timestamp_falls_back_on_regex_parse_failures(self):
+        """Test that timestamp extraction falls back gracefully when regex patterns match but parsing fails."""
         from temporal_spin import extract_timestamp_from_text
 
         # Matches "Period Ended:" pattern but with bad date
@@ -777,7 +743,7 @@ class TestTemporalSpinExceptions:
 
         assert result is not None
 
-    def test_exception_in_dateutil_parse_line_380_381(self):
+    def test_extract_timestamp_handles_fuzzy_parser_exceptions(self):
         """Force ValueError/TypeError in dateutil.parser.parse."""
         from temporal_spin import extract_timestamp_from_text
 

@@ -332,12 +332,7 @@ class TemporalSpinRetriever:
             # This ensures proper year-to-year separation (decade scale) AND
             # within-year position matching (quarter scale)
             logger.debug(f"doc.doc_id: {doc.doc_id}")
-            if (
-                hasattr(query, "phi_start")
-                and hasattr(doc, "phi_start")
-                and query.phi_start
-                and doc.phi_start
-            ):
+            if query.is_arc and doc.is_arc:
                 logger.debug(
                     f"Decade: {query.phi_start['decade']} to {query.phi_end['decade']} vs {doc.phi_start['decade']} to {doc.phi_end['decade']}"
                 )
@@ -352,7 +347,8 @@ class TemporalSpinRetriever:
                 # If ANY scale has zero overlap, reject the document
                 reject_doc = False
 
-                #               for scale_name in ['quarter', 'decade', 'century']:
+                # Check scales in order of hierarchy: century → decade → quarter
+                # This ensures broad temporal boundaries are validated before finer-grained scales
                 for scale_name in ["century", "decade", "quarter"]:
                     scale_overlap = arc_overlap(
                         query.phi_start[scale_name],

@@ -24,7 +24,7 @@ dev = ["black>=23.0.0", "flake8>=6.0.0", "pytest-cov>=4.1.0"]
 
 [tool.black]
 line-length = 79
-target-version = ['py39', 'py310', 'py311', 'py312']
+target-version = ['py39', 'py310', 'py311', 'py312', 'py313']
 include = '\.pyi?$'
 extend-exclude = '''
 /(

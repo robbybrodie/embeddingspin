@@ -263,20 +263,22 @@ def arc_overlap(
     """
     tau = math.tau
 
-    # Check for full circles BEFORE normalization
+    # Check for full circles BEFORE normalization.
+    # Use raw lengths (before modulo) to detect full circles.
     raw_len1 = phi_end1 - phi_start1
     raw_len2 = phi_end2 - phi_start2
 
-    is_full1 = abs(raw_len1) >= tau - 1e-10
-    is_full2 = abs(raw_len2) >= tau - 1e-10
+    eps = 1e-10
+    is_full1 = raw_len1 >= tau - eps
+    is_full2 = raw_len2 >= tau - eps
 
-    # If either is a full circle, return the min of the two arc lengths
+    # If either is a full circle, return the min of the two arc lengths (capped at tau)
     if is_full1 and is_full2:
         return tau
     elif is_full1:
-        return min(tau, abs(raw_len2))
+        return min(tau, raw_len2)
     elif is_full2:
-        return min(tau, abs(raw_len1))
+        return min(tau, raw_len1)
 
     # Normalize both intervals for non-full-circle case
     phi_start1, phi_end1 = _normalize_phi_interval(phi_start1, phi_end1)

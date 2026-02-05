@@ -16,14 +16,21 @@ import pytest  # type: ignore[import]
 # Modify path to allow imports from parent directory
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ingestion import TemporalSpinIngestionPipeline  # noqa: E402
-from ingestion import create_ingestion_pipeline  # noqa: E402
+from ingestion import (
+    TemporalSpinIngestionPipeline,  # noqa: E402
+    create_ingestion_pipeline,  # noqa: E402
+)
 from llamastack_client import MockEmbeddingClient  # noqa: E402
 from retrieval import TemporalSpinRetriever  # noqa: E402
+
 # fmt: off
-from temporal_spin import (RetrievalResult, SpinDocument,  # noqa: E402
-                           arc_overlap, extract_timestamp_from_text,
-                           jaccard_similarity_arcs)
+from temporal_spin import (  # noqa: E402
+    RetrievalResult,
+    SpinDocument,
+    arc_overlap,
+    extract_timestamp_from_text,
+    jaccard_similarity_arcs,
+)
 from vector_store import InMemoryVectorStore  # noqa: E402
 
 # fmt: on
@@ -515,8 +522,6 @@ class TestArcOverlapFullCircles:
 
     def test_full_circle_raw_length(self):
         """Test arc with raw length >= tau."""
-        from temporal_spin import arc_overlap
-
         # Create arcs where raw length is >= tau (full circle)
         start1 = 0.0
         end1 = math.tau + 1.0  # More than full circle
@@ -526,7 +531,7 @@ class TestArcOverlapFullCircles:
         overlap = arc_overlap(start1, end1, start2, end2)
         # Should return min(len1, len2) where len1=tau, len2=1.0
         assert overlap >= 0.9  # Close to 1.0
-        assert overlap <= math.tau
+        assert overlap <= 1.1  # Should be around 1.0
 
 
 class TestTimestampExtractionExceptionHandling:

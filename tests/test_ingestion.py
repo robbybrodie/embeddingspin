@@ -554,7 +554,7 @@ class TestErrorHandling:
         self, ingestion_pipeline: "TemporalSpinIngestionPipeline"
     ) -> None:
         """Special characters should be handled."""
-        text = "Test with émojis 🚀 and spëcial çharacters!"
+        text = "Test with emojis 🚀 and spëcial çharacters!"
 
         doc = ingestion_pipeline.ingest_document(
             text=text, timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc)
@@ -571,7 +571,7 @@ class TestErrorHandling:
         doc_id = "duplicate_test"
 
         # First ingestion
-        _doc1 = ingestion_pipeline.ingest_document(  # noqa: F841
+        ingestion_pipeline.ingest_document(
             text="First version",
             timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc),
             doc_id=doc_id,
