@@ -12,10 +12,11 @@ Tests the complete retrieval pipeline:
 
 import os
 import sys
-import pytest
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from unittest.mock import Mock
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
