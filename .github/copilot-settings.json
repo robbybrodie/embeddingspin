@@ -1,0 +1,28 @@
+{
+  "allowedTools": {
+    "run_in_terminal": {
+      "allowedCommands": [
+        "python*",
+        "pytest*",
+        "flake8*",
+        "black*",
+        "mypy*",
+        "ruff*",
+        "isort*",
+        "autopep8*",
+        "pylint*",
+        "grep*",
+        "find*",
+        "wc*",
+        "cat*",
+        "head*",
+        "tail*",
+        "ls*",
+        "pwd*"
+      ],
+      "description": "Allow safe read-only and linting/formatting commands"
+    }
+  },
+  "autoRunSafeCommands": true,
+  "description": "GitHub Copilot can automatically run linting, formatting, and safe inspection commands without asking permission"
+}

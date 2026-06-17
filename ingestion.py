@@ -12,28 +12,28 @@ Pipeline:
 5. Store in vector database
 """
 
-import uuid
-from typing import List, Optional, Dict, Any
-from datetime import datetime, timezone
 import os
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
+from llamastack_client import LlamaStackEmbeddingClient, MockEmbeddingClient
 from temporal_spin import (
+    CENTURY_SCALE_YEARS,
+    DECADE_SCALE_YEARS,
+    QUARTER_SCALE_YEARS,
+    T0_SECONDS,
     SpinDocument,
     compute_spin_vector,
     extract_timestamp_from_text,
-    T0_SECONDS,
-    QUARTER_SCALE_YEARS,
-    DECADE_SCALE_YEARS,
-    CENTURY_SCALE_YEARS
 )
-from llamastack_client import LlamaStackEmbeddingClient, MockEmbeddingClient
 from vector_store import VectorStore
 
 
 class TemporalSpinIngestionPipeline:
     """
     Pipeline for ingesting documents with temporal-phase spin encoding.
-    
+
     This pipeline:
     1. Accepts raw text documents with optional timestamps
     2. Extracts or infers timestamps from content or metadata
@@ -41,21 +41,21 @@ class TemporalSpinIngestionPipeline:
     4. Computes 2D spin vectors from timestamps
     5. Concatenates semantic + spin into full embeddings
     6. Stores in vector database
-    
+
     No model retraining required - spin encoding is applied post-hoc.
     """
-    
+
     def __init__(
         self,
         embedding_client: LlamaStackEmbeddingClient,
         vector_store: VectorStore,
         t0_seconds: float = T0_SECONDS,
         period_seconds: float = None,  # Deprecated - multi-scale now
-        temporal_scale: float = 1.0
+        temporal_scale: float = 1.0,
     ):
         """
         Initialize ingestion pipeline.
-        
+
         Args:
             embedding_client: Client for obtaining semantic embeddings
             vector_store: Vector database for storage
@@ -70,28 +70,28 @@ class TemporalSpinIngestionPipeline:
         self.t0_seconds = t0_seconds
         # period_seconds is deprecated - multi-scale encoding now used
         self.temporal_scale = temporal_scale
-    
+
     def ingest_document(
         self,
         text: str,
         timestamp: Optional[datetime] = None,
         doc_id: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
-        end_timestamp: Optional[datetime] = None
+        end_timestamp: Optional[datetime] = None,
     ) -> SpinDocument:
         """
         Ingest a single document with point or arc temporal encoding.
-        
+
         Args:
             text: Document text
             timestamp: Start timestamp (if None, will be extracted)
             doc_id: Optional document ID (if None, will be generated)
             metadata: Optional metadata dictionary
             end_timestamp: Optional end timestamp for arc mode (time period)
-        
+
         Returns:
             SpinDocument with embeddings and spin encoding (point or arc)
-        
+
         Note:
             - If end_timestamp is None: Point mode (instant in time)
             - If end_timestamp is provided: Arc mode (time period/interval)
@@ -99,37 +99,38 @@ class TemporalSpinIngestionPipeline:
         # Generate ID if not provided
         if doc_id is None:
             doc_id = str(uuid.uuid4())
-        
+
         # Extract or infer timestamp
         if timestamp is None:
             timestamp = extract_timestamp_from_text(
-                text,
-                fallback=datetime.now(timezone.utc)
+                text, fallback=datetime.now(timezone.utc)
             )
-        
-        # Ensure timezone-aware
+
+        # Normalize to UTC: assume naive timestamps are UTC, convert aware timestamps to UTC
         if timestamp.tzinfo is None:
             timestamp = timestamp.replace(tzinfo=timezone.utc)
-        
+        else:
+            timestamp = timestamp.astimezone(timezone.utc)
+
         # Get semantic embedding from LlamaStack
         semantic_embedding = self.embedding_client.embed_single(text)
-        
+
         # Compute temporal spin vector (point or arc mode)
         timestamp_seconds = timestamp.timestamp()
         end_seconds = end_timestamp.timestamp() if end_timestamp else None
-        
+
         spin_vector, phi_centers, phi_starts, phi_ends = compute_spin_vector(
             timestamp_seconds,
             self.t0_seconds,
             period_seconds=None,  # Deprecated - multi-scale encoding
             temporal_scale=self.temporal_scale,
-            end_timestamp_seconds=end_seconds
+            end_timestamp_seconds=end_seconds,
         )
-        
+
         # Concatenate: full_embedding = [semantic_embedding, spin_vector]
         # spin_vector is now 9D (3 scales × 3D each)
         full_embedding = semantic_embedding + spin_vector
-        
+
         # Create SpinDocument
         doc = SpinDocument(
             doc_id=doc_id,
@@ -143,80 +144,87 @@ class TemporalSpinIngestionPipeline:
             end_timestamp=end_timestamp,
             phi_start=phi_starts,  # Now a dict
             phi_end=phi_ends,  # Now a dict
-            is_arc=(end_timestamp is not None)
+            is_arc=(end_timestamp is not None),
         )
-        
+
         # Store in vector database
         self.vector_store.add_documents([doc])
-        
+
         return doc
-    
+
     def ingest_batch(
         self,
         texts: List[str],
         timestamps: Optional[List[datetime]] = None,
         doc_ids: Optional[List[str]] = None,
         metadatas: Optional[List[Dict[str, Any]]] = None,
-        end_timestamps: Optional[List[Optional[datetime]]] = None
+        end_timestamps: Optional[List[Optional[datetime]]] = None,
     ) -> List[SpinDocument]:
         """
         Ingest multiple documents in a batch (more efficient).
-        
+
         Args:
             texts: List of document texts
             timestamps: Optional list of start timestamps (None = auto-extract)
             doc_ids: Optional list of document IDs
             metadatas: Optional list of metadata dicts
             end_timestamps: Optional list of end timestamps for arc mode (None = point mode)
-        
+
         Returns:
             List of SpinDocument objects
         """
         n = len(texts)
-        
+
         # Handle optional arguments
         if timestamps is None:
             timestamps = [None] * n
-        if doc_ids is None:
-            doc_ids = [str(uuid.uuid4()) for _ in range(n)]
+        # Generate UUIDs for any None doc_ids in a single pass
+        doc_ids = [
+            doc_id or str(uuid.uuid4()) for doc_id in (doc_ids or [None] * n)
+        ]
         if metadatas is None:
             metadatas = [{}] * n
         if end_timestamps is None:
             end_timestamps = [None] * n
-        
+
         # Extract timestamps where needed
         resolved_timestamps = []
         for i, (text, ts) in enumerate(zip(texts, timestamps)):
             if ts is None:
                 ts = extract_timestamp_from_text(
-                    text,
-                    fallback=datetime.now(timezone.utc)
+                    text, fallback=datetime.now(timezone.utc)
                 )
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
+            else:
+                ts = ts.astimezone(timezone.utc)
             resolved_timestamps.append(ts)
-        
+
         # Batch embedding request (efficient!)
         semantic_embeddings = self.embedding_client.embed(texts)
-        
+
         # Create SpinDocument objects
         documents = []
         for i in range(n):
             # Compute spin vector (point or arc mode)
             timestamp_seconds = resolved_timestamps[i].timestamp()
-            end_seconds = end_timestamps[i].timestamp() if end_timestamps[i] else None
-            
-            spin_vector, phi_centers, phi_starts, phi_ends = compute_spin_vector(
-                timestamp_seconds,
-                self.t0_seconds,
-                period_seconds=None,  # Deprecated - multi-scale encoding
-                temporal_scale=self.temporal_scale,
-                end_timestamp_seconds=end_seconds
+            end_seconds = (
+                end_timestamps[i].timestamp() if end_timestamps[i] else None
             )
-            
+
+            spin_vector, phi_centers, phi_starts, phi_ends = (
+                compute_spin_vector(
+                    timestamp_seconds,
+                    self.t0_seconds,
+                    period_seconds=None,  # Deprecated - multi-scale encoding
+                    temporal_scale=self.temporal_scale,
+                    end_timestamp_seconds=end_seconds,
+                )
+            )
+
             # Concatenate (spin vector is now 9D for multi-scale)
             full_embedding = semantic_embeddings[i] + spin_vector
-            
+
             # Create document
             doc = SpinDocument(
                 doc_id=doc_ids[i],
@@ -230,27 +238,27 @@ class TemporalSpinIngestionPipeline:
                 end_timestamp=end_timestamps[i],
                 phi_start=phi_starts,  # Dict
                 phi_end=phi_ends,  # Dict
-                is_arc=(end_timestamps[i] is not None)
+                is_arc=(end_timestamps[i] is not None),
             )
             documents.append(doc)
-        
+
         # Batch insert into vector store
         self.vector_store.add_documents(documents)
-        
+
         return documents
-    
+
     def ingest_from_files(
         self,
         file_paths: List[str],
-        extract_timestamp_from_filename: bool = True
+        extract_timestamp_from_filename: bool = True,
     ) -> List[SpinDocument]:
         """
         Ingest documents from files.
-        
+
         Args:
             file_paths: List of file paths to ingest
             extract_timestamp_from_filename: Try to parse timestamp from filename
-        
+
         Returns:
             List of ingested SpinDocument objects
         """
@@ -258,12 +266,12 @@ class TemporalSpinIngestionPipeline:
         timestamps = []
         doc_ids = []
         metadatas = []
-        
+
         for file_path in file_paths:
             # Read file
-            with open(file_path, 'r', encoding='utf-8') as f:
+            with open(file_path, "r", encoding="utf-8") as f:
                 text = f.read()
-            
+
             # Try to extract timestamp
             timestamp = None
             if extract_timestamp_from_filename:
@@ -272,17 +280,17 @@ class TemporalSpinIngestionPipeline:
                     timestamp = extract_timestamp_from_text(filename)
                 except Exception:
                     pass
-            
+
             # Fallback to file modification time
             if timestamp is None:
                 mtime = os.path.getmtime(file_path)
                 timestamp = datetime.fromtimestamp(mtime, tz=timezone.utc)
-            
+
             texts.append(text)
             timestamps.append(timestamp)
             doc_ids.append(file_path)  # Use file path as ID
             metadatas.append({"file_path": file_path})
-        
+
         return self.ingest_batch(texts, timestamps, doc_ids, metadatas)
 
 
@@ -291,34 +299,30 @@ def create_ingestion_pipeline(
     llamastack_url: Optional[str] = None,
     model_name: str = "text-embedding-v1",
     use_mock_embeddings: bool = False,
-    embedding_dim: int = 384
+    embedding_dim: int = 384,
 ) -> TemporalSpinIngestionPipeline:
     """
     Convenience factory to create an ingestion pipeline.
-    
+
     Args:
         vector_store: Vector database instance
         llamastack_url: LlamaStack API URL (or use LLAMASTACK_URL env var)
         model_name: Embedding model name
         use_mock_embeddings: Use mock embeddings for testing
         embedding_dim: Embedding dimension (for mock client)
-    
+
     Returns:
         Configured TemporalSpinIngestionPipeline
     """
     if use_mock_embeddings:
         embedding_client = MockEmbeddingClient(
-            model_name="mock-embed",
-            dimension=embedding_dim
+            model_name="mock-embed", dimension=embedding_dim
         )
     else:
         embedding_client = LlamaStackEmbeddingClient(
-            base_url=llamastack_url,
-            model_name=model_name
+            base_url=llamastack_url, model_name=model_name
         )
-    
-    return TemporalSpinIngestionPipeline(
-        embedding_client=embedding_client,
-        vector_store=vector_store
-    )
 
+    return TemporalSpinIngestionPipeline(
+        embedding_client=embedding_client, vector_store=vector_store
+    )
