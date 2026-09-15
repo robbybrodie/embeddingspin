@@ -626,8 +626,9 @@ MIT.
 
 Robby Brodie — robbytherobot@redhat.com
 
-- **Bryon Baker** (brbaker@redhat.com) for collaborative development of the
+- **Bryon Baker** (brbaker@redhat.com) and **Joe Wood** for collaborative development of the
   arc-based temporal encoding, which solved hierarchical time-period matching for
   financial reporting (10-Q ⊂ 10-K) and time-series chunking.
 - Red Hat AI 3 (LlamaStack) for the Model Gateway API.
 - pgvector and Chroma for vector search; dateutil and FastAPI for the rest.
+- A special mention to Matt Hicks for his problem statement definaiton and encouragement
