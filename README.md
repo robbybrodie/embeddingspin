@@ -622,7 +622,13 @@ re-index, and the code says so rather than implying otherwise.
 
 ## Licence & credits
 
-MIT.
+Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+Apache 2.0 rather than a permissive licence without a patent clause, because the
+method is the subject of pending patent application 20251253US. Section 3 of the
+licence grants an express, royalty-free patent licence covering the claims this
+implementation necessarily infringes, so a user receives copyright *and* patent
+permission from the same document rather than only the former.
 
 Robby Brodie — robbytherobot@redhat.com
 

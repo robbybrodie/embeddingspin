@@ -1,0 +1,9 @@
+Temporal-Phase Spin Retrieval
+Copyright 2026 Red Hat, Inc.
+
+This product includes software developed at Red Hat, Inc.
+
+The temporal encoding method implemented here is the subject of pending patent
+application 20251253US. It is licensed under the Apache License, Version 2.0,
+whose Section 3 grants an express, royalty-free patent licence covering claims
+necessarily infringed by this implementation.
