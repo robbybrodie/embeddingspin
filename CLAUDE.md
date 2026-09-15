@@ -1,0 +1,1 @@
+- ignore the ibm_reports_10yr folder and ignore the venv folder

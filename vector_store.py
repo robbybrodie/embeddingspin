@@ -1,590 +1,521 @@
 """
-Vector Database Abstraction Layer
-==================================
+Vector Store Abstraction
+========================
 
-Provides a unified interface to different vector databases (PGVector, Chroma)
-for storing and retrieving temporal-phase spin embeddings.
+Backends for storing modified semantic vectors — ``[semantic | temporal]`` — and
+retrieving them by similarity.
 
-This abstraction allows the spin retrieval system to work with any backend
-without changing the core algorithm.
+Every stored row carries its temporal **header** alongside the vector. The header
+declares the schema version, the epoch, the year convention, and the period of each
+tuple present. A reader therefore never has to assume the temporal block is nine
+dimensions: it reads the tuple count from the header and strips exactly that many
+triples off the tail of the embedding. That is what makes the hierarchy extensible
+without a migration — a corpus written with three circles and one written with four
+can sit in the same collection and still be parsed unambiguously.
+
+What a store does *not* do is deduplicate. A chunk split across period boundaries is
+several rows here on purpose, so that geometric overlap works at every boundary;
+collapsing them back to one result happens at the application layer, on ``group_id``.
 """
 
-import json
-import uuid
-from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Optional, Tuple
-from datetime import datetime
-from dataclasses import asdict
+from __future__ import annotations
 
+import json
+import logging
+from abc import ABC, abstractmethod
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+from temporal_config import DEFAULT_HIERARCHY, TemporalHierarchy
+from temporal_encoding import TemporalEncoding, TemporalInterval
 from temporal_spin import SpinDocument, cosine_similarity
+
+logger = logging.getLogger(__name__)
+
+# Metadata keys the store owns. Everything else in a document's metadata is treated
+# as caller-supplied and round-trips untouched.
+_RESERVED_KEYS = frozenset(
+    {"temporal_encoding", "temporal_header", "group_id", "interval_start", "interval_end"}
+)
 
 
 class VectorStore(ABC):
     """
-    Abstract base class for vector database backends.
-    
-    Implementations must support:
-    - Storing documents with high-dimensional embeddings
-    - Retrieving top-k similar documents by cosine similarity
-    - Storing and retrieving metadata
+    Base class for backends.
+
+    Subclasses must preserve the temporal encoding losslessly: a document written and
+    read back must produce identical tuples, header and ``group_id``.
     """
-    
+
+    #: Hierarchy the stored vectors were encoded under. Set on first write.
+    hierarchy: Optional[TemporalHierarchy] = None
+
+    def set_hierarchy(self, hierarchy: TemporalHierarchy) -> None:
+        """Record the hierarchy this store's contents are encoded under."""
+        if self.hierarchy is not None and not self.hierarchy.is_compatible_with(hierarchy):
+            raise ValueError(
+                "cannot mix incompatible hierarchies in one store:\n"
+                f"  existing: {self.hierarchy.fingerprint()}\n"
+                f"  incoming: {hierarchy.fingerprint()}"
+            )
+        self.hierarchy = hierarchy
+
     @abstractmethod
     def add_documents(self, documents: List[SpinDocument]) -> None:
-        """
-        Add documents to the vector store.
-        
-        Args:
-            documents: List of SpinDocument objects with embeddings
-        """
-        pass
-    
+        """Write documents. Each representation of a split chunk is its own row."""
+
     @abstractmethod
     def search(
         self,
         query_embedding: List[float],
         top_k: int = 10,
-        filter_dict: Optional[Dict[str, Any]] = None
+        filter_dict: Optional[Dict[str, Any]] = None,
     ) -> List[Tuple[SpinDocument, float]]:
-        """
-        Search for similar documents.
-        
-        Args:
-            query_embedding: Query vector
-            top_k: Number of results to return
-            filter_dict: Optional metadata filters
-        
-        Returns:
-            List of (document, similarity_score) tuples
-        """
-        pass
-    
+        """Return up to ``top_k`` ``(document, similarity)`` pairs, best first."""
+
     @abstractmethod
     def get_document(self, doc_id: str) -> Optional[SpinDocument]:
-        """Retrieve a document by ID."""
-        pass
-    
+        """Fetch one representation by its unique id."""
+
     @abstractmethod
     def count(self) -> int:
-        """Return total number of documents."""
-        pass
-    
+        """Number of stored representations (not distinct chunks)."""
+
     @abstractmethod
     def clear(self) -> None:
-        """Remove all documents."""
-        pass
+        """Remove everything."""
+
+    # -- shared helpers ---------------------------------------------------
+
+    def _encode_metadata(self, doc: SpinDocument) -> Dict[str, Any]:
+        """Flatten a document's temporal state into scalar-valued metadata."""
+        encoding = doc.encoding.to_dict()
+        metadata: Dict[str, Any] = {
+            "temporal_encoding": json.dumps(encoding),
+            "group_id": doc.group_id,
+            "interval_start": doc.interval.start.isoformat(),
+            "interval_end": doc.interval.end.isoformat() if doc.interval.end else "",
+        }
+        for key, value in (doc.metadata or {}).items():
+            if key in _RESERVED_KEYS:
+                continue
+            if isinstance(value, (str, int, float, bool)):
+                metadata[key] = value
+        return metadata
+
+    def _decode_document(
+        self,
+        doc_id: str,
+        text: str,
+        metadata: Dict[str, Any],
+        full_embedding: Optional[List[float]],
+    ) -> SpinDocument:
+        """Rebuild a ``SpinDocument`` from a stored row."""
+        encoding = TemporalEncoding.from_dict(json.loads(metadata["temporal_encoding"]))
+
+        # The header declares how many tuples were written, so the split point
+        # between the semantic and temporal blocks is known exactly rather than
+        # assumed. This is what lets three-circle and four-circle vectors coexist.
+        semantic_embedding: List[float] = []
+        if full_embedding:
+            temporal_dims = 3 * len(encoding.tuples)
+            if len(full_embedding) > temporal_dims:
+                semantic_embedding = list(full_embedding[:-temporal_dims])
+
+        user_metadata = {
+            k: v for k, v in metadata.items() if k not in _RESERVED_KEYS
+        }
+        user_metadata["group_id"] = encoding.group_id
+
+        return SpinDocument(
+            doc_id=doc_id,
+            text=text,
+            semantic_embedding=semantic_embedding,
+            encoding=encoding,
+            full_embedding=list(full_embedding) if full_embedding else [],
+            group_id=encoding.group_id,
+            metadata=user_metadata,
+        )
+
+
+# ============================================================================
+# In-memory
+# ============================================================================
 
 
 class InMemoryVectorStore(VectorStore):
     """
-    Simple in-memory vector store for prototyping and testing.
-    
-    Stores all documents in RAM and performs brute-force cosine similarity
-    search. Suitable for datasets < 10k documents.
-    
-    For production with larger datasets, use ChromaVectorStore or
-    PGVectorStore instead.
+    Brute-force store for prototyping and tests. Suitable below ~10k rows.
+
+    Supports the same metadata filter grammar as Chroma (``$and``, ``$or``, ``$in``,
+    ``$ne``, and bare equality) so that switching backends does not change query
+    behaviour.
     """
-    
-    def __init__(self):
-        """Initialize empty in-memory store."""
+
+    def __init__(self, hierarchy: Optional[TemporalHierarchy] = None) -> None:
         self.documents: Dict[str, SpinDocument] = {}
-        self.embeddings: Dict[str, List[float]] = {}
-    
+        self.hierarchy = hierarchy
+
     def add_documents(self, documents: List[SpinDocument]) -> None:
-        """Add documents to in-memory store."""
         for doc in documents:
+            if self.hierarchy is None:
+                self.hierarchy = doc.encoding.hierarchy
             self.documents[doc.doc_id] = doc
-            self.embeddings[doc.doc_id] = doc.full_embedding
-    
+
     def search(
         self,
         query_embedding: List[float],
         top_k: int = 10,
-        filter_dict: Optional[Dict[str, Any]] = None
+        filter_dict: Optional[Dict[str, Any]] = None,
     ) -> List[Tuple[SpinDocument, float]]:
-        """
-        Brute-force cosine similarity search.
-        
-        Args:
-            query_embedding: Query vector
-            top_k: Number of results to return
-            filter_dict: Optional metadata filters (not implemented)
-        
-        Returns:
-            List of (document, similarity_score) tuples, sorted by score
-        """
-        if not self.documents:
-            return []
-        
-        # Compute similarities for all documents
-        scores = []
-        for doc_id, doc in self.documents.items():
-            embedding = self.embeddings[doc_id]
-            score = cosine_similarity(query_embedding, embedding)
-            scores.append((doc, score))
-        
-        # Sort by score descending
-        scores.sort(key=lambda x: x[1], reverse=True)
-        
-        return scores[:top_k]
-    
+        scored: List[Tuple[SpinDocument, float]] = []
+        for doc in self.documents.values():
+            if filter_dict and not _matches_filter(doc.metadata, filter_dict):
+                continue
+            scored.append((doc, cosine_similarity(query_embedding, doc.full_embedding)))
+        scored.sort(key=lambda pair: pair[1], reverse=True)
+        return scored[:top_k]
+
     def get_document(self, doc_id: str) -> Optional[SpinDocument]:
-        """Retrieve document by ID."""
         return self.documents.get(doc_id)
-    
+
+    def get_group(self, group_id: str) -> List[SpinDocument]:
+        """Every representation sharing a ``group_id``, in representation order."""
+        found = [d for d in self.documents.values() if d.group_id == group_id]
+        return sorted(found, key=lambda d: d.encoding.representation_index)
+
     def count(self) -> int:
-        """Return number of stored documents."""
         return len(self.documents)
-    
+
+    def count_groups(self) -> int:
+        """Number of distinct chunks, collapsing split representations."""
+        return len({d.group_id for d in self.documents.values()})
+
     def clear(self) -> None:
-        """Clear all documents."""
         self.documents.clear()
-        self.embeddings.clear()
+
+
+def _matches_filter(metadata: Dict[str, Any], clause: Dict[str, Any]) -> bool:
+    """Evaluate a Chroma-style metadata filter against one document's metadata."""
+    for key, condition in clause.items():
+        if key == "$and":
+            if not all(_matches_filter(metadata, sub) for sub in condition):
+                return False
+        elif key == "$or":
+            if not any(_matches_filter(metadata, sub) for sub in condition):
+                return False
+        elif isinstance(condition, dict):
+            value = metadata.get(key)
+            for operator, operand in condition.items():
+                if operator == "$in" and value not in operand:
+                    return False
+                if operator == "$nin" and value in operand:
+                    return False
+                if operator == "$ne" and value == operand:
+                    return False
+                if operator == "$eq" and value != operand:
+                    return False
+        elif metadata.get(key) != condition:
+            return False
+    return True
+
+
+# ============================================================================
+# Chroma
+# ============================================================================
 
 
 class ChromaVectorStore(VectorStore):
     """
-    Chroma DB vector store implementation.
-    
-    Chroma is a lightweight vector database that's easy to set up and
-    works well for prototypes and medium-sized datasets (< 1M docs).
-    
-    Installation:
-        pip install chromadb
-    
-    Usage:
-        store = ChromaVectorStore(
-            collection_name="temporal_spin_docs",
-            persist_directory="./chroma_db"
-        )
+    Chroma backend. Install with ``pip install chromadb``.
+
+    Chroma requires a fixed dimensionality per collection. Extending the hierarchy
+    therefore changes the vector width and needs a new collection — which is exactly
+    why the header records the tuple count, so the two collections remain
+    individually interpretable and a reader can tell them apart.
     """
-    
+
     def __init__(
         self,
         collection_name: str = "temporal_spin_collection",
         persist_directory: Optional[str] = None,
-        embedding_function=None
-    ):
-        """
-        Initialize Chroma vector store.
-        
-        Args:
-            collection_name: Name of the Chroma collection
-            persist_directory: Directory to persist data (None = in-memory)
-            embedding_function: Optional Chroma embedding function
-                               (we manage embeddings ourselves, so pass None)
-        """
+        hierarchy: Optional[TemporalHierarchy] = None,
+    ) -> None:
         try:
             import chromadb
-        except ImportError:
-            raise ImportError(
-                "chromadb not installed. Install with: pip install chromadb"
-            )
-        
-        # Create Chroma client (ChromaDB 1.3+ API)
-        if persist_directory:
-            self.client = chromadb.PersistentClient(path=persist_directory)
-        else:
-            self.client = chromadb.Client()
-        
-        # Get or create collection
-        # embedding_function=None means we provide embeddings ourselves
+        except ImportError as exc:  # pragma: no cover - environment dependent
+            raise ImportError("chromadb not installed. Install with: pip install chromadb") from exc
+
+        self.client = (
+            chromadb.PersistentClient(path=persist_directory)
+            if persist_directory
+            else chromadb.Client()
+        )
+        self.collection_name = collection_name
         self.collection = self.client.get_or_create_collection(
             name=collection_name,
-            metadata={"description": "Temporal-phase spin embeddings"}
+            metadata={"description": "Hierarchical phase-encoded temporal vectors"},
         )
-    
+        self.hierarchy = hierarchy
+
     def add_documents(self, documents: List[SpinDocument]) -> None:
-        """Add documents to Chroma collection."""
         if not documents:
             return
-        
-        ids = [doc.doc_id for doc in documents]
-        embeddings = [doc.full_embedding for doc in documents]
-        
-        # Prepare metadata (Chroma requires JSON-serializable values)
-        metadatas = []
-        documents_text = []
         for doc in documents:
-            metadata = {
-                "timestamp": doc.timestamp.isoformat(),
-                "phi": json.dumps(doc.phi),  # Serialize dict to JSON string
-                "spin_vector": json.dumps(doc.spin_vector),
-                # NEW: Store arc encoding metadata
-                "is_arc": doc.is_arc,
-            }
-            
-            # Add end_timestamp for arc-encoded documents
-            if doc.end_timestamp:
-                metadata["end_timestamp"] = doc.end_timestamp.isoformat()
-            
-            # Add phi_start and phi_end for arc-encoded documents
-            if doc.phi_start:
-                metadata["phi_start"] = json.dumps(doc.phi_start)
-            if doc.phi_end:
-                metadata["phi_end"] = json.dumps(doc.phi_end)
-            
-            if doc.metadata:
-                # Add custom metadata (ensure JSON-serializable)
-                for k, v in doc.metadata.items():
-                    if isinstance(v, (str, int, float, bool)):
-                        metadata[k] = v
-            
-            metadatas.append(metadata)
-            documents_text.append(doc.text)
-        
-        # Add to collection
+            if self.hierarchy is None:
+                self.hierarchy = doc.encoding.hierarchy
         self.collection.add(
-            ids=ids,
-            embeddings=embeddings,
-            metadatas=metadatas,
-            documents=documents_text
+            ids=[d.doc_id for d in documents],
+            embeddings=[d.full_embedding for d in documents],
+            metadatas=[self._encode_metadata(d) for d in documents],
+            documents=[d.text for d in documents],
         )
-    
+
     def search(
         self,
         query_embedding: List[float],
         top_k: int = 10,
-        filter_dict: Optional[Dict[str, Any]] = None
+        filter_dict: Optional[Dict[str, Any]] = None,
     ) -> List[Tuple[SpinDocument, float]]:
-        """
-        Search Chroma collection.
-        
-        Args:
-            query_embedding: Query vector
-            top_k: Number of results
-            filter_dict: Optional metadata filters (Chroma where clause)
-        
-        Returns:
-            List of (SpinDocument, similarity_score) tuples
-        """
-        # Query Chroma (uses cosine similarity by default)
         results = self.collection.query(
             query_embeddings=[query_embedding],
             n_results=top_k,
             where=filter_dict,
-            include=["documents", "metadatas", "distances", "embeddings"]
+            include=["documents", "metadatas", "distances", "embeddings"],
         )
-        
-        # Parse results
-        documents = []
-        if results["ids"] and len(results["ids"]) > 0 and len(results["ids"][0]) > 0:
-            for i, doc_id in enumerate(results["ids"][0]):
-                text = results["documents"][0][i]
-                metadata = results["metadatas"][0][i]
-                distance = results["distances"][0][i] if "distances" in results else 0
-                
-                # Get embedding and convert to list if numpy array
-                embedding = None
-                if "embeddings" in results and len(results["embeddings"]) > 0 and len(results["embeddings"][0]) > i:
-                    emb = results["embeddings"][0][i]
-                    # Handle numpy arrays
-                    if hasattr(emb, 'tolist'):
-                        embedding = emb.tolist()
-                    else:
-                        embedding = list(emb) if emb is not None else []
-                
-                # Reconstruct SpinDocument
-                timestamp = datetime.fromisoformat(metadata["timestamp"])
-                phi = json.loads(metadata["phi"])  # Deserialize JSON string to dict
-                spin_vector = json.loads(metadata["spin_vector"])
-                
-                # NEW: Deserialize arc encoding metadata
-                is_arc = metadata.get("is_arc", False)
-                end_timestamp = None
-                phi_start = None
-                phi_end = None
-                
-                if is_arc:
-                    end_ts_str = metadata.get("end_timestamp")
-                    if end_ts_str:
-                        end_timestamp = datetime.fromisoformat(end_ts_str)
-                    
-                    phi_start_str = metadata.get("phi_start")
-                    if phi_start_str:
-                        phi_start = json.loads(phi_start_str)
-                    
-                    phi_end_str = metadata.get("phi_end")
-                    if phi_end_str:
-                        phi_end = json.loads(phi_end_str)
-                
-                # Extract semantic embedding from full embedding
-                # full_embedding = [semantic (N dims), temporal_9d (9 dims)]
-                # temporal_9d = [x_q, y_q, z_q, x_d, y_d, z_d, x_c, y_c, z_c]
-                if embedding and len(embedding) > 9:
-                    semantic_embedding = embedding[:-9]  # All but last 9 dims
-                    full_embedding = embedding
-                else:
-                    # Fallback: no embeddings returned, leave empty
-                    semantic_embedding = []
-                    full_embedding = []
-                
-                doc = SpinDocument(
-                    doc_id=doc_id,
-                    text=text,
-                    timestamp=timestamp,
-                    semantic_embedding=semantic_embedding,
-                    spin_vector=spin_vector,
-                    phi=phi,
-                    full_embedding=full_embedding,
-                    metadata={k: v for k, v in metadata.items() 
-                             if k not in ["timestamp", "phi", "spin_vector", "is_arc", 
-                                          "end_timestamp", "phi_start", "phi_end"]},
-                    end_timestamp=end_timestamp,
-                    phi_start=phi_start,
-                    phi_end=phi_end,
-                    is_arc=is_arc
+        if not results.get("ids") or not results["ids"][0]:
+            return []
+
+        out: List[Tuple[SpinDocument, float]] = []
+        for i, doc_id in enumerate(results["ids"][0]):
+            embedding = _as_list(_index(results, "embeddings", i))
+            metadata = results["metadatas"][0][i]
+            distance = _index(results, "distances", i) or 0.0
+            try:
+                doc = self._decode_document(
+                    doc_id, results["documents"][0][i], metadata, embedding
                 )
-                
-                # Convert distance to similarity (Chroma returns L2 distance)
-                # For normalized vectors: similarity ≈ 1 - (distance²/2)
-                similarity = 1.0 - (distance ** 2) / 2.0
-                
-                documents.append((doc, similarity))
-        
-        return documents
-    
+            except (KeyError, ValueError, json.JSONDecodeError):
+                logger.warning("skipping row %s: unreadable temporal encoding", doc_id)
+                continue
+            # Chroma returns squared L2 distance over normalised vectors.
+            out.append((doc, 1.0 - (distance ** 2) / 2.0))
+        return out
+
     def get_document(self, doc_id: str) -> Optional[SpinDocument]:
-        """Retrieve document by ID."""
-        results = self.collection.get(ids=[doc_id])
+        results = self.collection.get(ids=[doc_id], include=["documents", "metadatas", "embeddings"])
         if not results["ids"]:
             return None
-        
-        text = results["documents"][0]
-        metadata = results["metadatas"][0]
-        
-        timestamp = datetime.fromisoformat(metadata["timestamp"])
-        phi = metadata["phi"]
-        spin_vector = json.loads(metadata["spin_vector"])
-        
-        return SpinDocument(
-            doc_id=doc_id,
-            text=text,
-            timestamp=timestamp,
-            semantic_embedding=[],
-            spin_vector=spin_vector,
-            phi=phi,
-            full_embedding=[],
-            metadata={k: v for k, v in metadata.items() 
-                     if k not in ["timestamp", "phi", "spin_vector"]}
+        embedding = _as_list(results["embeddings"][0]) if results.get("embeddings") else None
+        return self._decode_document(
+            doc_id, results["documents"][0], results["metadatas"][0], embedding
         )
-    
+
     def count(self) -> int:
-        """Return number of documents in collection."""
         return self.collection.count()
-    
+
     def clear(self) -> None:
-        """Clear all documents from collection."""
-        # Chroma doesn't have a clear method, so delete and recreate
-        self.client.delete_collection(self.collection.name)
+        self.client.delete_collection(self.collection_name)
         self.collection = self.client.create_collection(
-            name=self.collection.name,
-            metadata={"description": "Temporal-phase spin embeddings"}
+            name=self.collection_name,
+            metadata={"description": "Hierarchical phase-encoded temporal vectors"},
         )
+
+
+def _index(results: Dict[str, Any], key: str, i: int) -> Any:
+    block = results.get(key)
+    if block is None or len(block) == 0 or block[0] is None or len(block[0]) <= i:
+        return None
+    return block[0][i]
+
+
+def _as_list(value: Any) -> Optional[List[float]]:
+    if value is None:
+        return None
+    return value.tolist() if hasattr(value, "tolist") else list(value)
+
+
+# ============================================================================
+# PostgreSQL + pgvector
+# ============================================================================
 
 
 class PGVectorStore(VectorStore):
     """
-    PostgreSQL with pgvector extension.
-    
-    pgvector adds vector similarity search to PostgreSQL, making it suitable
-    for production deployments with large datasets.
-    
-    Setup:
-        1. Install PostgreSQL with pgvector extension
-        2. CREATE EXTENSION vector;
-        3. pip install psycopg2-binary
-    
-    Usage:
-        store = PGVectorStore(
-            connection_string="postgresql://user:pass@localhost:5432/vectordb",
-            table_name="spin_documents"
-        )
+    PostgreSQL backend using the pgvector extension.
+
+    Setup::
+
+        CREATE EXTENSION vector;
+        pip install psycopg2-binary
+
+    The temporal header and tuples are stored in a JSONB column rather than being
+    spread across typed columns. That keeps the schema stable when the hierarchy is
+    extended: adding a fourth circle changes the vector width and the JSON contents,
+    but not the table definition.
+
+    ``group_id`` is indexed because deduplication reads it on every query.
     """
-    
+
     def __init__(
         self,
         connection_string: str,
         table_name: str = "spin_documents",
-        embedding_dim: int = 386  # 384 semantic + 2 spin
-    ):
-        """
-        Initialize PGVector store.
-        
-        Args:
-            connection_string: PostgreSQL connection string
-            table_name: Table name for documents
-            embedding_dim: Dimension of full embeddings
-        """
+        embedding_dim: int = 1545,  # 1536 semantic + 9 temporal
+        hierarchy: Optional[TemporalHierarchy] = None,
+    ) -> None:
         try:
-            import psycopg2
-            from psycopg2.extras import Json
-        except ImportError:
+            import psycopg2  # noqa: F401
+        except ImportError as exc:  # pragma: no cover - environment dependent
             raise ImportError(
                 "psycopg2 not installed. Install with: pip install psycopg2-binary"
-            )
-        
+            ) from exc
+
         self.connection_string = connection_string
         self.table_name = table_name
         self.embedding_dim = embedding_dim
-        
-        # Create table if it doesn't exist
+        self.hierarchy = hierarchy
         self._init_table()
-    
-    def _get_connection(self):
-        """Create a new database connection."""
+
+    def _connect(self):
         import psycopg2
+
         return psycopg2.connect(self.connection_string)
-    
-    def _init_table(self):
-        """Create table with pgvector extension."""
-        with self._get_connection() as conn:
-            with conn.cursor() as cur:
-                # Enable pgvector extension
-                cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-                
-                # Create table
-                cur.execute(f"""
-                    CREATE TABLE IF NOT EXISTS {self.table_name} (
-                        doc_id TEXT PRIMARY KEY,
-                        text TEXT NOT NULL,
-                        timestamp TIMESTAMPTZ NOT NULL,
-                        phi DOUBLE PRECISION NOT NULL,
-                        spin_vector JSONB NOT NULL,
-                        embedding vector({self.embedding_dim}) NOT NULL,
-                        metadata JSONB
-                    );
-                """)
-                
-                # Create index for vector similarity search
-                cur.execute(f"""
-                    CREATE INDEX IF NOT EXISTS {self.table_name}_embedding_idx
-                    ON {self.table_name}
-                    USING ivfflat (embedding vector_cosine_ops)
-                    WITH (lists = 100);
-                """)
-                
-                conn.commit()
-    
+
+    def _init_table(self) -> None:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {self.table_name} (
+                    doc_id            TEXT PRIMARY KEY,
+                    group_id          TEXT NOT NULL,
+                    text              TEXT NOT NULL,
+                    interval_start    TIMESTAMPTZ NOT NULL,
+                    interval_end      TIMESTAMPTZ,
+                    temporal_encoding JSONB NOT NULL,
+                    embedding         vector({self.embedding_dim}) NOT NULL,
+                    metadata          JSONB
+                );
+                """
+            )
+            cur.execute(
+                f"""CREATE INDEX IF NOT EXISTS {self.table_name}_embedding_idx
+                    ON {self.table_name} USING ivfflat (embedding vector_cosine_ops)
+                    WITH (lists = 100);"""
+            )
+            cur.execute(
+                f"""CREATE INDEX IF NOT EXISTS {self.table_name}_group_idx
+                    ON {self.table_name} (group_id);"""
+            )
+            conn.commit()
+
     def add_documents(self, documents: List[SpinDocument]) -> None:
-        """Insert documents into PostgreSQL."""
-        import psycopg2
         from psycopg2.extras import Json
-        
-        with self._get_connection() as conn:
-            with conn.cursor() as cur:
-                for doc in documents:
-                    # Convert embedding to string format for pgvector
-                    embedding_str = "[" + ",".join(map(str, doc.full_embedding)) + "]"
-                    
-                    cur.execute(f"""
-                        INSERT INTO {self.table_name}
-                        (doc_id, text, timestamp, phi, spin_vector, embedding, metadata)
-                        VALUES (%s, %s, %s, %s, %s, %s::vector, %s)
-                        ON CONFLICT (doc_id) DO UPDATE SET
-                            text = EXCLUDED.text,
-                            timestamp = EXCLUDED.timestamp,
-                            phi = EXCLUDED.phi,
-                            spin_vector = EXCLUDED.spin_vector,
-                            embedding = EXCLUDED.embedding,
-                            metadata = EXCLUDED.metadata;
-                    """, (
+
+        with self._connect() as conn, conn.cursor() as cur:
+            for doc in documents:
+                if self.hierarchy is None:
+                    self.hierarchy = doc.encoding.hierarchy
+                cur.execute(
+                    f"""
+                    INSERT INTO {self.table_name}
+                        (doc_id, group_id, text, interval_start, interval_end,
+                         temporal_encoding, embedding, metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s::vector, %s)
+                    ON CONFLICT (doc_id) DO UPDATE SET
+                        group_id          = EXCLUDED.group_id,
+                        text              = EXCLUDED.text,
+                        interval_start    = EXCLUDED.interval_start,
+                        interval_end      = EXCLUDED.interval_end,
+                        temporal_encoding = EXCLUDED.temporal_encoding,
+                        embedding         = EXCLUDED.embedding,
+                        metadata          = EXCLUDED.metadata;
+                    """,
+                    (
                         doc.doc_id,
+                        doc.group_id,
                         doc.text,
-                        doc.timestamp,
-                        doc.phi,
-                        Json(doc.spin_vector),
-                        embedding_str,
-                        Json(doc.metadata or {})
-                    ))
-                
-                conn.commit()
-    
+                        doc.interval.start,
+                        doc.interval.end,
+                        Json(doc.encoding.to_dict()),
+                        "[" + ",".join(map(str, doc.full_embedding)) + "]",
+                        Json(
+                            {
+                                k: v
+                                for k, v in (doc.metadata or {}).items()
+                                if k not in _RESERVED_KEYS
+                            }
+                        ),
+                    ),
+                )
+            conn.commit()
+
     def search(
         self,
         query_embedding: List[float],
         top_k: int = 10,
-        filter_dict: Optional[Dict[str, Any]] = None
+        filter_dict: Optional[Dict[str, Any]] = None,
     ) -> List[Tuple[SpinDocument, float]]:
-        """
-        Vector similarity search using pgvector.
-        
-        Uses cosine similarity (1 - cosine_distance) for ranking.
-        """
-        embedding_str = "[" + ",".join(map(str, query_embedding)) + "]"
-        
-        with self._get_connection() as conn:
-            with conn.cursor() as cur:
-                # Cosine similarity: 1 - (embedding <=> query)
-                query = f"""
-                    SELECT doc_id, text, timestamp, phi, spin_vector, metadata,
-                           1 - (embedding <=> %s::vector) AS similarity
-                    FROM {self.table_name}
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT %s;
-                """
-                
-                cur.execute(query, (embedding_str, embedding_str, top_k))
-                rows = cur.fetchall()
-                
-                documents = []
-                for row in rows:
-                    doc_id, text, timestamp, phi, spin_vector, metadata, similarity = row
-                    
-                    doc = SpinDocument(
-                        doc_id=doc_id,
-                        text=text,
-                        timestamp=timestamp,
-                        semantic_embedding=[],  # Not stored separately
-                        spin_vector=spin_vector,
-                        phi=phi,
-                        full_embedding=[],
-                        metadata=metadata or {}
+        vector = "[" + ",".join(map(str, query_embedding)) + "]"
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT doc_id, text, temporal_encoding, metadata, embedding,
+                       1 - (embedding <=> %s::vector) AS similarity
+                FROM {self.table_name}
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s;
+                """,
+                (vector, vector, top_k),
+            )
+            out: List[Tuple[SpinDocument, float]] = []
+            for doc_id, text, encoding_json, metadata, embedding, similarity in cur.fetchall():
+                merged = dict(metadata or {})
+                merged["temporal_encoding"] = json.dumps(encoding_json)
+                out.append(
+                    (
+                        self._decode_document(doc_id, text, merged, _parse_pg_vector(embedding)),
+                        float(similarity),
                     )
-                    
-                    documents.append((doc, similarity))
-                
-                return documents
-    
-    def get_document(self, doc_id: str) -> Optional[SpinDocument]:
-        """Retrieve document by ID."""
-        with self._get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(f"""
-                    SELECT doc_id, text, timestamp, phi, spin_vector, metadata
-                    FROM {self.table_name}
-                    WHERE doc_id = %s;
-                """, (doc_id,))
-                
-                row = cur.fetchone()
-                if not row:
-                    return None
-                
-                doc_id, text, timestamp, phi, spin_vector, metadata = row
-                
-                return SpinDocument(
-                    doc_id=doc_id,
-                    text=text,
-                    timestamp=timestamp,
-                    semantic_embedding=[],
-                    spin_vector=spin_vector,
-                    phi=phi,
-                    full_embedding=[],
-                    metadata=metadata or {}
                 )
-    
-    def count(self) -> int:
-        """Count total documents."""
-        with self._get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(f"SELECT COUNT(*) FROM {self.table_name};")
-                return cur.fetchone()[0]
-    
-    def clear(self) -> None:
-        """Delete all documents."""
-        with self._get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(f"DELETE FROM {self.table_name};")
-                conn.commit()
+            return out
 
+    def get_document(self, doc_id: str) -> Optional[SpinDocument]:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""SELECT doc_id, text, temporal_encoding, metadata, embedding
+                    FROM {self.table_name} WHERE doc_id = %s;""",
+                (doc_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            doc_id, text, encoding_json, metadata, embedding = row
+            merged = dict(metadata or {})
+            merged["temporal_encoding"] = json.dumps(encoding_json)
+            return self._decode_document(doc_id, text, merged, _parse_pg_vector(embedding))
+
+    def count(self) -> int:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM {self.table_name};")
+            return cur.fetchone()[0]
+
+    def count_groups(self) -> int:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(DISTINCT group_id) FROM {self.table_name};")
+            return cur.fetchone()[0]
+
+    def clear(self) -> None:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(f"DELETE FROM {self.table_name};")
+            conn.commit()
+
+
+def _parse_pg_vector(value: Any) -> Optional[List[float]]:
+    """pgvector returns its vector type as a bracketed string."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [float(x) for x in value.strip("[]").split(",") if x]
+    return list(value)

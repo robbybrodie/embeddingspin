@@ -10,13 +10,13 @@ This document outlines all prerequisites and dependencies needed to run the Temp
 - **Windows** (with WSL2 recommended)
 
 ### Python Version
-- **Python 3.8 or higher** (Required)
-- Python 3.9, 3.10, or 3.11 recommended
+- **Python 3.9 or higher** (Required; the test suite runs on 3.9)
+- Python 3.10 or 3.11 recommended
 
 **Check your Python version:**
 ```bash
 python3 --version
-# Should output: Python 3.8.x or higher
+# Should output: Python 3.9.x or higher
 ```
 
 **Install Python if needed:**
@@ -52,6 +52,15 @@ pip install -r requirements.txt
 | `pydantic` | ≥2.0.0 | Data validation |
 
 ### Optional Dependencies
+
+#### For OpenAI Embeddings
+```bash
+pip install openai>=1.0.0
+export OPENAI_API_KEY=sk-...
+```
+
+Used when: `USE_OPENAI_EMBEDDINGS=true` (the default in `api.py`). Set
+`USE_MOCK_EMBEDDINGS=true` to skip it entirely.
 
 #### For Chroma Vector Store
 ```bash
@@ -217,6 +226,7 @@ Create a `.env` file or export these variables:
 
 ### Minimal Configuration (Demo Mode)
 ```bash
+USE_OPENAI_EMBEDDINGS=false
 USE_MOCK_EMBEDDINGS=true
 VECTOR_STORE=memory
 LOAD_DEMO_DATA=true
@@ -225,6 +235,7 @@ LOAD_DEMO_DATA=true
 ### Production Configuration
 ```bash
 # Embeddings
+USE_OPENAI_EMBEDDINGS=false
 USE_MOCK_EMBEDDINGS=false
 LLAMASTACK_URL=http://llamastack-service:8000
 LLAMASTACK_API_KEY=your_api_key
@@ -238,7 +249,22 @@ DATABASE_URL=postgresql://user:pass@host:5432/db
 PORT=8080
 HOST=0.0.0.0
 LOAD_DEMO_DATA=false
+DEFAULT_BETA=0.5
 ```
+
+### Temporal Encoding
+
+These two change how time itself is encoded, and both are read **once, at import**.
+Changing either on a populated corpus requires a re-index — see
+[CHANGELOG.md](CHANGELOG.md) and the epoch section of the README.
+
+```bash
+EMBEDDINGSPIN_EPOCH=1900-01-01          # base epoch t₀; coverage runs to t₀ + 256y
+EMBEDDINGSPIN_YEAR_CONVENTION=calendar  # 'calendar' (actual 365/366d) or 'linear'
+```
+
+Leave both unset unless you know why you are changing them. The defaults are what
+the corpus, the tests and the published worked example assume.
 
 ## Verification
 
@@ -260,20 +286,34 @@ which python  # Should point to venv/bin/python
 ```bash
 # Test core imports
 python -c "
+import temporal_config
+import temporal_encoding
 import temporal_spin
 import llamastack_client
 import vector_store
 import ingestion
 import retrieval
+import query_decomposition
 print('✓ All modules imported successfully')
 "
+
+# Confirm the active hierarchy is the expected one
+python -c "
+from temporal_config import DEFAULT_HIERARCHY as h
+print(h.fingerprint(), '| coverage through', h.coverage_end_year)
+"
+# → v2|1900-01-01|calendar|quarter:1:4+decade:16:16+century:256:16 | coverage through 2156
+
+# Run the test suite (no network, no external services)
+pytest
 
 # Run demo
 python demo.py
 
 # Test API server
-python api.py &
+USE_OPENAI_EMBEDDINGS=false USE_MOCK_EMBEDDINGS=true python api.py &
 curl http://localhost:8080/health
+curl http://localhost:8080/stats
 ```
 
 ## Common Issues & Solutions
@@ -294,9 +334,25 @@ pip install chromadb
 **Solution:**
 ```bash
 # Use mock embeddings for testing
-export USE_MOCK_EMBEDDINGS=true
+export USE_OPENAI_EMBEDDINGS=false USE_MOCK_EMBEDDINGS=true
 python demo.py
 ```
+
+### Issue: "No module named 'openai'"
+**Solution:** `api.py` defaults to OpenAI embeddings. Either install the client and
+set `OPENAI_API_KEY`, or opt out:
+```bash
+export USE_OPENAI_EMBEDDINGS=false USE_MOCK_EMBEDDINGS=true
+```
+
+### Issue: "retriever hierarchy is incompatible with the vector store's"
+**Solution:** The corpus was written under a different epoch, year convention or
+scale set than the one now configured. Either restore the old configuration or
+re-index. `describe_epoch_migration(old, new)` will tell you which it is.
+
+### Issue: "beta must be in [0, 1]"
+**Solution:** β changed meaning in 2.0 — it is an interpolation weight now, not a
+Gaussian width. Start at 0.5. See [CHANGELOG.md](CHANGELOG.md).
 
 ### Issue: "pg_config executable not found"
 **Solution:**
@@ -326,8 +382,8 @@ python3.10 -m venv venv
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-pip install fastapi uvicorn httpx pydantic python-dateutil numpy
-export USE_MOCK_EMBEDDINGS=true
+pip install fastapi uvicorn httpx pydantic python-dateutil numpy pytest
+export USE_OPENAI_EMBEDDINGS=false USE_MOCK_EMBEDDINGS=true
 python demo.py
 ```
 
@@ -352,7 +408,7 @@ python demo.py
 - LlamaStack Model Gateway
 - Monitoring and logging
 
-See `DEPLOYMENT.md` for complete production setup.
+See the Configuration section of [README.md](README.md) for the full variable list.
 
 ## Hardware Requirements
 
@@ -374,13 +430,14 @@ See `DEPLOYMENT.md` for complete production setup.
 
 ## Quick Start Checklist
 
-- [ ] Python 3.8+ installed
+- [ ] Python 3.9+ installed
 - [ ] `pip` and `venv` available
 - [ ] Virtual environment created and activated
 - [ ] Dependencies installed: `pip install -r requirements.txt`
 - [ ] (Optional) PostgreSQL + pgvector if using PGVector
 - [ ] (Optional) LlamaStack URL configured if not using mock
 - [ ] Environment variables set (or using defaults)
+- [ ] Tests pass: `pytest`
 - [ ] Demo runs successfully: `python demo.py`
 - [ ] API starts successfully: `python api.py`
 
@@ -388,10 +445,11 @@ See `DEPLOYMENT.md` for complete production setup.
 
 If you encounter issues:
 
-1. **Check prerequisites:** Ensure Python 3.8+ and pip are installed
+1. **Check prerequisites:** Ensure Python 3.9+ and pip are installed
 2. **Read error messages:** Most issues are dependency-related
 3. **Use mock mode:** Test without external dependencies
-4. **Check documentation:** README.md, DEPLOYMENT.md, USAGE_EXAMPLES.md
+4. **Check documentation:** [README.md](README.md),
+   [PATENT_ALIGNMENT.md](PATENT_ALIGNMENT.md), [CHANGELOG.md](CHANGELOG.md)
 5. **Verify environment:** `pip list` to see installed packages
 
 ## Next Steps
@@ -399,10 +457,10 @@ If you encounter issues:
 Once prerequisites are met:
 
 1. Run quickstart: `./quickstart.sh`
-2. Try demo: `python demo.py`
+2. Try demo: `python demo.py`, then `python arc_demo.py` for the geometry
 3. Explore API: `python api.py` → http://localhost:8080/docs
-4. Read examples: `USAGE_EXAMPLES.md`
-5. Deploy to production: `DEPLOYMENT.md`
+4. Read the design: [README.md](README.md)
+5. Read the claim map: [PATENT_ALIGNMENT.md](PATENT_ALIGNMENT.md)
 
 ---
 
@@ -413,7 +471,7 @@ Once prerequisites are met:
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-export USE_MOCK_EMBEDDINGS=true
+export USE_OPENAI_EMBEDDINGS=false USE_MOCK_EMBEDDINGS=true
 python demo.py
 ```
 

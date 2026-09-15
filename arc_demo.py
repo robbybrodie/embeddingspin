@@ -1,288 +1,293 @@
 #!/usr/bin/env python3
 """
-Arc-Based Temporal Encoding Demo
-=================================
+Arcs, Points and Segments
+=========================
 
-Demonstrates the new arc encoding feature for time periods/intervals.
+The half of the system ``demo.py`` does not cover: what an arc actually is, how
+points and arcs coexist in one index, and what the segment subdivision buys.
 
-This demo shows:
-1. Point encoding (legacy): Single timestamp events
-2. Arc encoding (new): Time period documents (quarters, years)
-3. Hierarchical matching: Quarterly reports ⊂ Annual reports
-4. Mixed collections: Points and arcs coexisting
+1. **Point mode** (``z = 0``) — an instant. A news announcement.
+2. **Arc mode** (``z > 0``) — a duration. A 10-Q covers a quarter; a 10-K covers a
+   year. Containment falls out of the geometry: the Q2 arc lies inside the annual
+   arc on the 1-year circle, so an annual query overlaps every quarter in it.
+3. **Segments** — each circle is divided evenly: the 1-year circle into four
+   quarters, the 16-year circle into sixteen years. The geometry stays even so the
+   index is one multiply; which *calendar* quarter an interval occupies is resolved
+   from the dates at encoding time and stored. Scoring each intersected segment
+   independently keeps a document on the far side of a divider from being lost when
+   it genuinely overlaps.
 
-Use Case: Financial reporting hierarchy (10-Q quarterly vs 10-K annual)
+Run: ``python arc_demo.py``
 """
 
-import os
+from __future__ import annotations
+
+import math
 from datetime import datetime, timezone
-from typing import List
 
-# Use mock embeddings for demo
-os.environ['USE_MOCK_EMBEDDINGS'] = 'true'
-
-from llamastack_client import MockEmbeddingClient
-from vector_store import InMemoryVectorStore
 from ingestion import TemporalSpinIngestionPipeline
+from llamastack_client import MockEmbeddingClient
 from retrieval import TemporalSpinRetriever
+from temporal_config import DEFAULT_HIERARCHY, QUARTER_SCALE
+from temporal_encoding import (
+    TemporalInterval,
+    encode_single,
+    evaluate_scale,
+    segment_bounds,
+    segment_label,
+)
 from temporal_spin import SpinDocument
+from vector_store import InMemoryVectorStore
 
 
-def print_header(title: str):
-    """Print a formatted section header."""
+def print_header(title: str) -> None:
     print("\n" + "=" * 80)
     print(f"  {title}")
     print("=" * 80 + "\n")
 
 
-def print_doc_info(doc: SpinDocument):
-    """Print document temporal encoding info."""
-    mode = "🔵 ARC" if doc.is_arc else "⚫ POINT"
-    print(f"{mode} | {doc.doc_id[:30]}")
+def describe(doc: SpinDocument) -> None:
+    mode = "ARC  " if doc.is_arc else "POINT"
+    print(f"  [{mode}] {doc.doc_id:<22}", end="")
     if doc.is_arc:
-        print(f"      Period: {doc.timestamp.date()} to {doc.end_timestamp.date()}")
-        arc_days = (doc.end_timestamp - doc.timestamp).days
-        print(f"      Duration: {arc_days} days")
-        print(f"      Arc length: {doc.spin_vector[2]:.4f} radians")
+        quarter = doc.encoding.tuple_for("quarter")
+        print(
+            f" {doc.interval.start.date()} -> {doc.interval.end.date()}"
+            f"   {doc.interval.duration_days:6.1f}d"
+            f"   z={math.degrees(quarter.z):6.1f}° on the 1-year circle"
+        )
     else:
-        print(f"      Timestamp: {doc.timestamp.date()}")
-    print(f"      Spin vector dim: {len(doc.spin_vector)}D")
+        print(f" {doc.interval.start.date()}              instant, z=0")
+
+
+def print_results(results, description: str) -> None:
+    print(f"\n{'─' * 80}")
+    print(f"{description} — {len(results)} result(s)\n")
+    for r in results:
+        kind = "ARC  " if r.interval.end else "POINT"
+        print(
+            f"  {r.rank}. [{kind}] {r.doc_id:<22} combined {r.combined_score:.4f}"
+            f"  (semantic {r.semantic_score:+.4f}, temporal {r.temporal_alignment:.4f})"
+        )
+
+
+def main() -> None:
+    print_header("Arcs, Points and Segments")
+
+    embedding_client = MockEmbeddingClient(dimension=384)
+    vector_store = InMemoryVectorStore(hierarchy=DEFAULT_HIERARCHY)
+    pipeline = TemporalSpinIngestionPipeline(
+        embedding_client, vector_store, hierarchy=DEFAULT_HIERARCHY
+    )
+    retriever = TemporalSpinRetriever(
+        embedding_client, vector_store, hierarchy=DEFAULT_HIERARCHY, default_beta=0.5
+    )
+
+    # ------------------------------------------------------------------
+    # Ingestion
+    # ------------------------------------------------------------------
+
+    print_header("INGESTION: annual arcs, quarterly arcs, point events")
+
+    documents = []
+
+    print("Annual reports (10-K) — one full-year arc each:")
+    for year in (2022, 2023, 2024):
+        documents += pipeline.ingest_document(
+            text=(
+                f"IBM Annual Report {year}: total revenue, cloud growth, AI investment. "
+                f"Strategic focus on hybrid cloud and quantum computing. "
+                f"Fiscal year ended December 31, {year}."
+            ),
+            interval=TemporalInterval.of_year(year),
+            doc_id=f"IBM-10K-{year}",
+            metadata={"type": "10-K", "year": year},
+        )
+
+    print("Quarterly reports (10-Q) for 2023 — one quarter arc each:")
+    for quarter in (1, 2, 3, 4):
+        documents += pipeline.ingest_document(
+            text=(
+                f"IBM Q{quarter} 2023 Report: revenue, cloud revenue growth, "
+                f"quantum computing milestone."
+            ),
+            interval=TemporalInterval.of_quarter(2023, quarter),
+            doc_id=f"IBM-10Q-2023-Q{quarter}",
+            metadata={"type": "10-Q", "year": 2023, "quarter": quarter},
+        )
+
+    print("Announcements — points, no duration:")
+    events = [
+        ("2023-02-15", "IBM announces a major AI partnership to accelerate adoption."),
+        ("2023-05-10", "IBM unveils a 1000-qubit quantum processor at a tech conference."),
+        ("2023-08-22", "IBM cloud revenue exceeds expectations; hybrid cloud growth continues."),
+        ("2023-11-05", "IBM Q3 earnings beat estimates across all business segments."),
+    ]
+    for date_str, text in events:
+        moment = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        documents += pipeline.ingest_document(
+            text=text,
+            interval=TemporalInterval.point(moment),
+            doc_id=f"IBM-NEWS-{date_str}",
+            metadata={"type": "news"},
+        )
+
+    print()
+    for doc in documents:
+        describe(doc)
+
+    arcs = [d for d in documents if d.is_arc]
+    points = [d for d in documents if not d.is_arc]
+    print(f"\n  {len(documents)} representations: {len(arcs)} arcs, {len(points)} points.")
+    print("  Both live in one index and one coordinate space; a point is just an arc")
+    print("  of zero length, so no separate code path is needed to compare them.")
+
+    # ------------------------------------------------------------------
+    # Containment
+    # ------------------------------------------------------------------
+
+    print_header("CONTAINMENT: an annual query reaches every quarter inside it")
+
+    results = retriever.search(
+        "IBM fiscal year 2023 performance",
+        interval=TemporalInterval.of_year(2023),
+        beta=0.7,
+        top_k_final=10,
+    )
+    print_results(results, "Query: FY2023 (a full-year arc)")
+    print()
+    print("  The four 2023 quarters and the four 2023 announcements all sit inside the")
+    print("  query arc, so all of them overlap. The 2022 and 2024 annual reports occupy")
+    print("  the same phase on the 1-year circle — every year does — and are rejected")
+    print("  on the 16-year circle instead.")
+
+    print_header("CONTAINMENT: a quarterly query, and what it excludes")
+
+    results = retriever.search(
+        "Q2 2023 revenue cloud growth",
+        interval=TemporalInterval.of_quarter(2023, 2),
+        beta=0.7,
+        top_k_final=10,
+    )
+    print_results(results, "Query: Q2 2023")
+    print()
+    print("  Q2 2023, the 2023 annual report (which contains Q2), and the 10 May")
+    print("  announcement (a point inside the arc) survive. Q1, Q3 and Q4 do not")
+    print("  overlap on the 1-year circle and are gated out.")
+
+    print_header("A POINT QUERY")
+
+    results = retriever.search(
+        "quantum computing breakthrough",
+        interval=TemporalInterval.point(datetime(2023, 5, 10, tzinfo=timezone.utc)),
+        beta=0.7,
+        top_k_final=6,
+    )
+    print_results(results, "Query: the instant 2023-05-10")
+    print()
+    print("  A zero-length query arc still overlaps any arc containing it, so the")
+    print("  enclosing quarter and year come back alongside the exact-date event.")
+
+    # ------------------------------------------------------------------
+    # Segments
+    # ------------------------------------------------------------------
+
+    print_header("SEGMENTS: even geometry, calendar identity")
+
+    for scale in DEFAULT_HIERARCHY.scales:
+        width = math.degrees(segment_bounds(scale, 0)[1])
+        print(
+            f"  {scale.name:<9} {scale.period_years:>5.0f}y divided into "
+            f"{scale.segments:>2} x {scale.segment_label:<14} ({width:.1f}° each)"
+        )
+
+    print()
+    print("  The circle is divided evenly, always. Periods and segment counts are")
+    print("  powers of two, so a segment index is int(fraction * segments) — one")
+    print("  multiply, no divider table, no branch, and it vectorises across a batch.")
+    print()
+    print("  The calendar is not even: quarters run 90, 91, 92 and 92 days, and a leap")
+    print("  day shifts every divider after February. None of that is allowed into the")
+    print("  geometry. Segment identity is resolved from the real dates once, at")
+    print("  encoding time, and stored. Even geometry first, calendar correction after:")
     print()
 
+    samples = [
+        ("Q1 2023", TemporalInterval.of_quarter(2023, 1)),
+        ("Q2 2023", TemporalInterval.of_quarter(2023, 2)),
+        ("Feb-May 2023", TemporalInterval(
+            datetime(2023, 2, 1, tzinfo=timezone.utc),
+            datetime(2023, 5, 1, tzinfo=timezone.utc),
+        )),
+        ("FY2023", TemporalInterval.of_year(2023)),
+    ]
+    for label, interval in samples:
+        tuple_ = encode_single(interval, DEFAULT_HIERARCHY).tuple_for("quarter")
+        names = ", ".join(
+            segment_label(QUARTER_SCALE, i, DEFAULT_HIERARCHY) for i in tuple_.segments
+        )
+        print(f"  {label:<14} touches {len(tuple_.segments)} segment(s): {names}")
 
-def print_results(results: List, query_type: str):
-    """Print retrieval results."""
-    print(f"\n{'─' * 80}")
-    print(f"Top {len(results)} Results (Query type: {query_type}):\n")
-    
-    for i, result in enumerate(results, 1):
-        doc_type = "🔵 ARC" if result.metadata.get('is_arc', False) else "⚫ POINT"
-        print(f"{i}. {doc_type} | Score: {result.combined_score:.4f} "
-              f"(semantic: {result.semantic_score:.4f}, "
-              f"temporal: {result.temporal_alignment:.4f})")
-        print(f"   {result.doc_id[:60]}")
-        print(f"   Year: {result.timestamp.year}")
+    print()
+    print("  Why it matters. A document running February to May straddles the 1 April")
+    print("  divider. Scored as one arc against a Q2 query it looks like a weak match,")
+    print("  because two thirds of it falls outside Q2. Scoring each intersected")
+    print("  segment on its own keeps the part that genuinely does overlap:")
+    print()
+
+    query_tuple = encode_single(
+        TemporalInterval.of_quarter(2023, 2), DEFAULT_HIERARCHY
+    ).tuple_for("quarter")
+    doc_tuple = encode_single(
+        TemporalInterval(
+            datetime(2023, 2, 1, tzinfo=timezone.utc),
+            datetime(2023, 5, 1, tzinfo=timezone.utc),
+        ),
+        DEFAULT_HIERARCHY,
+    ).tuple_for("quarter")
+
+    match = evaluate_scale(query_tuple, doc_tuple, QUARTER_SCALE)
+    print(f"    query  : Q2 2023")
+    print(f"    document: 2023-02-01 -> 2023-05-01")
+    print(f"    overlaps           : {match.overlaps}")
+    print(f"    shared segments    : {list(match.shared_segments)}")
+    for index, score in sorted(match.segment_jaccard.items()):
+        name = segment_label(QUARTER_SCALE, index, DEFAULT_HIERARCHY)
+        print(f"      {name:<12} per-segment Jaccard {score:.4f}")
+    print(f"    scale Jaccard      : {match.jaccard:.4f}")
+    print()
+    print("  A match in any one segment qualifies the document. Without that, a hard")
+    print("  divider would silently discard material that overlaps the query.")
+
+    # ------------------------------------------------------------------
+    # Beta
+    # ------------------------------------------------------------------
+
+    print_header("β ACROSS A MIXED COLLECTION")
+
+    print("Query: 'IBM cloud revenue', August 2023\n")
+    interval = TemporalInterval.of_month(2023, 8)
+    for beta in (0.0, 0.25, 0.5, 0.75, 1.0):
+        results = retriever.search(
+            "IBM cloud revenue", interval=interval, beta=beta, top_k_final=3
+        )
+        print(f"  β = {beta:.2f}:")
+        for r in results:
+            kind = "ARC  " if r.interval.end else "POINT"
+            print(f"    {r.rank}. [{kind}] {r.doc_id:<22} {r.combined_score:+.4f}")
         print()
 
+    print("  At β = 0 the ordering is whatever semantic similarity says; at β = 1 it is")
+    print("  temporal overlap alone. The gate applies throughout — β weights the")
+    print("  surviving candidates, it does not admit non-overlapping ones.")
 
-def main():
-    print_header("🎯 Temporal-Phase Spin: Arc Encoding Demo")
-    
-    print("Initializing system with mock embeddings...")
-    embedding_client = MockEmbeddingClient()
-    vector_store = InMemoryVectorStore()
-    pipeline = TemporalSpinIngestionPipeline(embedding_client, vector_store)
-    retriever = TemporalSpinRetriever(
-        embedding_client,
-        vector_store,
-        default_beta=5000.0  # Strong temporal focus
-    )
-    
-    # ========================================================================
-    # INGESTION: Create mixed collection of points and arcs
-    # ========================================================================
-    
-    print_header("📥 INGESTION: Mixed Point and Arc Documents")
-    
-    documents = []
-    
-    # 1. Annual reports (10-K) - Full year arcs
-    print("🔵 Ingesting Annual Reports (10-K) - Full year arcs:")
-    for year in [2022, 2023, 2024]:
-        doc = pipeline.ingest_document(
-            text=f"IBM Annual Report {year}: Total revenue $60B, cloud growth 15%, "
-                 f"AI investments increased significantly. Strategic focus on hybrid cloud "
-                 f"and quantum computing. Fiscal year ended December 31, {year}.",
-            timestamp=datetime(year, 1, 1, tzinfo=timezone.utc),
-            end_timestamp=datetime(year, 12, 31, tzinfo=timezone.utc),
-            doc_id=f"IBM-10K-{year}",
-            metadata={"type": "10-K", "year": year, "is_arc": True}
-        )
-        documents.append(doc)
-        print(f"  ✓ {year} Annual Report (365 days)")
-    
-    # 2. Quarterly reports (10-Q) for 2023
-    print("\n🔵 Ingesting Quarterly Reports (10-Q) for 2023 - Quarter arcs:")
-    quarters = [
-        ("Q1", 1, 1, 3, 31),
-        ("Q2", 4, 1, 6, 30),
-        ("Q3", 7, 1, 9, 30),
-        ("Q4", 10, 1, 12, 31)
-    ]
-    
-    for q_name, start_month, start_day, end_month, end_day in quarters:
-        doc = pipeline.ingest_document(
-            text=f"IBM {q_name} 2023 Report: Revenue $15B, cloud revenue up 12%, "
-                 f"quantum computing milestone achieved. Period ended "
-                 f"{datetime(2023, end_month, end_day).strftime('%B %d, 2023')}.",
-            timestamp=datetime(2023, start_month, start_day, tzinfo=timezone.utc),
-            end_timestamp=datetime(2023, end_month, end_day, tzinfo=timezone.utc),
-            doc_id=f"IBM-10Q-2023-{q_name}",
-            metadata={"type": "10-Q", "year": 2023, "quarter": q_name, "is_arc": True}
-        )
-        documents.append(doc)
-        duration = (doc.end_timestamp - doc.timestamp).days
-        print(f"  ✓ 2023 {q_name} ({duration} days)")
-    
-    # 3. Point-in-time events (news, announcements)
-    print("\n⚫ Ingesting Point-in-Time Events - Single timestamps:")
-    events = [
-        ("2023-02-15", "IBM announces major AI partnership on February 15, 2023. "
-                       "Strategic collaboration will accelerate AI adoption."),
-        ("2023-05-10", "IBM quantum computing breakthrough announced May 10, 2023. "
-                       "New 1000-qubit processor unveiled at tech conference."),
-        ("2023-08-22", "IBM cloud revenue exceeds expectations, reported August 22, 2023. "
-                       "Hybrid cloud growth continues strong trajectory."),
-        ("2023-11-05", "IBM Q3 earnings beat estimates, announced November 5, 2023. "
-                       "Strong performance across all business segments.")
-    ]
-    
-    for date_str, text in events:
-        timestamp = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        doc = pipeline.ingest_document(
-            text=text,
-            timestamp=timestamp,
-            doc_id=f"IBM-NEWS-{date_str}",
-            metadata={"type": "news", "is_arc": False}
-        )
-        documents.append(doc)
-        print(f"  ✓ {date_str} (point)")
-    
-    print(f"\n✅ Ingested {len(documents)} documents:")
-    print(f"   - 3 annual reports (arcs)")
-    print(f"   - 4 quarterly reports (arcs)")
-    print(f"   - 4 news events (points)")
-    
-    # ========================================================================
-    # RETRIEVAL DEMOS
-    # ========================================================================
-    
-    print_header("🔍 RETRIEVAL DEMO 1: Arc Query for Q2 2023")
-    print("Query: 'Q2 2023 revenue cloud growth'")
-    print("Period: April 1 - June 30, 2023 (Arc)")
-    print("Beta: 5000 (strong temporal focus)")
-    
-    results = retriever.search(
-        query_text="Q2 2023 revenue cloud growth",
-        query_timestamp=datetime(2023, 4, 1, tzinfo=timezone.utc),
-        end_timestamp=datetime(2023, 6, 30, tzinfo=timezone.utc),
-        beta=5000.0,
-        top_k_final=5
-    )
-    
-    print_results(results, "Arc (Q2 2023)")
-    
-    print("💡 Expected behavior:")
-    print("   1. Q2 2023 report should rank HIGHEST (exact arc match)")
-    print("   2. 2023 annual report should rank HIGH (contains Q2)")
-    print("   3. Adjacent quarters may rank lower (no overlap)")
-    print("   4. News from May should rank HIGH (point within arc)")
-    
-    # ========================================================================
-    
-    print_header("🔍 RETRIEVAL DEMO 2: Point Query for Specific Date")
-    print("Query: 'quantum computing breakthrough'")
-    print("Date: May 10, 2023 (Point)")
-    print("Beta: 5000")
-    
-    results = retriever.search(
-        query_text="quantum computing breakthrough",
-        query_timestamp=datetime(2023, 5, 10, tzinfo=timezone.utc),
-        beta=5000.0,
-        top_k_final=5
-    )
-    
-    print_results(results, "Point (May 10, 2023)")
-    
-    print("💡 Expected behavior:")
-    print("   1. May 10 news event should rank HIGHEST (exact point match)")
-    print("   2. Q2 2023 report should rank HIGH (contains May 10)")
-    print("   3. 2023 annual report should rank HIGH (contains May 10)")
-    print("   4. Q3 report ranks lower (May 10 outside Q3)")
-    
-    # ========================================================================
-    
-    print_header("🔍 RETRIEVAL DEMO 3: Annual Query (Full Year)")
-    print("Query: 'IBM fiscal year 2023 performance'")
-    print("Period: Jan 1 - Dec 31, 2023 (Arc)")
-    print("Beta: 5000")
-    
-    results = retriever.search(
-        query_text="IBM fiscal year 2023 performance",
-        query_timestamp=datetime(2023, 1, 1, tzinfo=timezone.utc),
-        end_timestamp=datetime(2023, 12, 31, tzinfo=timezone.utc),
-        beta=5000.0,
-        top_k_final=8
-    )
-    
-    print_results(results, "Arc (Full Year 2023)")
-    
-    print("💡 Expected behavior:")
-    print("   1. 2023 annual report should rank HIGHEST (exact arc match)")
-    print("   2. All 2023 quarterly reports rank HIGH (contained within annual)")
-    print("   3. All 2023 news events rank HIGH (contained within annual)")
-    print("   4. 2022/2024 annual reports rank lower (no overlap)")
-    
-    # ========================================================================
-    
-    print_header("🔍 RETRIEVAL DEMO 4: Point Query with Beta Comparison")
-    print("Query: 'IBM cloud revenue'")
-    print("Date: August 1, 2023 (Point)")
-    print("\nComparing different β values:")
-    
-    for beta in [0, 100, 1000, 5000]:
-        results = retriever.search(
-            query_text="IBM cloud revenue",
-            query_timestamp=datetime(2023, 8, 1, tzinfo=timezone.utc),
-            beta=beta,
-            top_k_final=3
-        )
-        
-        print(f"\n  β = {beta}:")
-        for i, r in enumerate(results[:3], 1):
-            doc_type = "ARC" if r.metadata.get('is_arc', False) else "POINT"
-            print(f"    {i}. [{doc_type:5}] {r.doc_id[:25]:25} | "
-                  f"Score: {r.combined_score:.4f} | "
-                  f"Year: {r.timestamp.year}")
-    
-    print("\n💡 Observation:")
-    print("   - β=0: Pure semantic (temporal ignored)")
-    print("   - β=100-1000: Weak-moderate temporal preference")
-    print("   - β=5000: Strong temporal focus (Aug 2023 prioritized)")
-    
-    # ========================================================================
-    
-    print_header("📊 SYSTEM STATISTICS")
-    
-    arc_docs = [d for d in documents if d.is_arc]
-    point_docs = [d for d in documents if not d.is_arc]
-    
-    print(f"Total documents: {len(documents)}")
-    print(f"  - Arc documents: {len(arc_docs)} ({len(arc_docs)/len(documents)*100:.1f}%)")
-    print(f"  - Point documents: {len(point_docs)} ({len(point_docs)/len(documents)*100:.1f}%)")
-    print(f"\nEmbedding dimensions:")
-    print(f"  - Point embeddings: {len(point_docs[0].full_embedding)}D "
-          f"(semantic + 3D spin, arc_length=0)")
-    print(f"  - Arc embeddings: {len(arc_docs[0].full_embedding)}D "
-          f"(semantic + 3D spin, arc_length>0)")
-    print(f"\nTemporal encoding range:")
-    print(f"  - Earliest: {min(d.timestamp for d in documents).date()}")
-    print(f"  - Latest: {max(d.end_timestamp or d.timestamp for d in documents).date()}")
-    
-    # ========================================================================
-    
-    print_header("✅ Arc Encoding Demo Complete!")
-    print("Key Takeaways:")
-    print("  1. ✅ Points and arcs coexist in the same vector store")
-    print("  2. ✅ Arc-to-arc matching uses Jaccard similarity (overlap)")
-    print("  3. ✅ Point-in-arc matching returns 1.0 (perfect temporal alignment)")
-    print("  4. ✅ Hierarchical time periods work (Q2 ⊂ Annual)")
-    print("  5. ✅ β parameter still controls temporal zoom")
-    print("\nThis solves the time-series retrieval problem for vector databases!")
-    print("Combined with time-aware chunking, this enables accurate temporal search.")
+    print_header("Done")
+    print("  • Points and arcs share one index and one comparison rule.")
+    print("  • Containment is geometric: no interval arithmetic at query time.")
+    print("  • Segments stay even in the geometry; calendar identity is fixed at ingestion.")
+    print("  • β weights the survivors; the arc-overlap gate decides who survives.")
     print("\n" + "=" * 80 + "\n")
 
 
 if __name__ == "__main__":
     main()
-

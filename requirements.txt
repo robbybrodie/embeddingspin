@@ -1,5 +1,5 @@
 # Temporal-Phase Spin Retrieval System
-# Requirements for Python 3.8+
+# Requirements for Python 3.9+ (tested on 3.9)
 #
 # ==============================================================================
 # IMPORTANT: External Services vs. Python Packages
@@ -19,7 +19,7 @@
 #
 # 2. PostgreSQL with pgvector (OPTIONAL - for production vector storage)
 #    - Database server for large-scale deployments
-#    - Installation: See PREREQUISITES.md or DEPLOYMENT.md
+#    - Installation: See PREREQUISITES.md
 #    - For testing: Use in-memory or Chroma vector stores instead
 #
 # ==============================================================================
@@ -35,6 +35,10 @@ httpx>=0.24.0
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 pydantic>=2.0.0
+
+# OpenAI embeddings (optional - needed when USE_OPENAI_EMBEDDINGS=true,
+# which is the default for api.py; set USE_MOCK_EMBEDDINGS=true to skip)
+openai>=1.0.0
 
 # Vector databases (optional - install as needed)
 # For Chroma support:

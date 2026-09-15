@@ -1,289 +1,270 @@
 """
-Temporal-Phase Spin Ingestion Pipeline
-=======================================
+Ingestion Pipeline
+==================
 
-Handles document ingestion with timestamp extraction and spin encoding.
+Turns raw chunks into indexed, temporally-encoded vectors:
 
-Pipeline:
-1. Extract or infer timestamp from document
-2. Obtain semantic embedding from LlamaStack
-3. Compute temporal spin vector
-4. Concatenate embeddings
-5. Store in vector database
+1. Resolve the chunk's temporal interval — supplied explicitly, or extracted from
+   the text.
+2. Embed the text with the frozen semantic model (one batched call per batch).
+3. Encode the interval across every circle in the hierarchy, splitting at period
+   boundaries into one or more representations.
+4. Concatenate each temporal vector onto the semantic vector.
+5. Write every representation to the store under a shared ``group_id``.
+
+Step 3 is where a chunk can become several rows. A 10-K covering 2017 through 2022
+crosses five 1-year boundaries and is indexed six times: same text, same semantic
+embedding, same ``group_id``, six different 1-year arcs. Its 16-year and 256-year
+tuples are identical across all six, because the span sits inside one block at those
+scales. Retrieval deduplicates on ``group_id``.
+
+Precision is fixed here, at ingestion, by how many circles the hierarchy declares —
+nothing is discarded later. What retrieval varies is how deeply it *traverses* that
+encoding, not how much of it exists.
 """
 
-import uuid
-from typing import List, Optional, Dict, Any
-from datetime import datetime, timezone
-import os
+from __future__ import annotations
 
-from temporal_spin import (
-    SpinDocument,
-    compute_spin_vector,
-    extract_timestamp_from_text,
-    T0_SECONDS,
-    QUARTER_SCALE_YEARS,
-    DECADE_SCALE_YEARS,
-    CENTURY_SCALE_YEARS
-)
-from llamastack_client import LlamaStackEmbeddingClient, MockEmbeddingClient
+import logging
+import os
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Sequence
+
+from temporal_config import DEFAULT_HIERARCHY, TemporalHierarchy
+from temporal_encoding import MAX_REPRESENTATIONS, TemporalInterval, encode
+from temporal_spin import SpinDocument, extract_interval_from_text, extract_timestamp_from_text
 from vector_store import VectorStore
+
+logger = logging.getLogger(__name__)
 
 
 class TemporalSpinIngestionPipeline:
     """
-    Pipeline for ingesting documents with temporal-phase spin encoding.
-    
-    This pipeline:
-    1. Accepts raw text documents with optional timestamps
-    2. Extracts or infers timestamps from content or metadata
-    3. Obtains semantic embeddings from LlamaStack Model Gateway
-    4. Computes 2D spin vectors from timestamps
-    5. Concatenates semantic + spin into full embeddings
-    6. Stores in vector database
-    
-    No model retraining required - spin encoding is applied post-hoc.
+    Post-hoc temporal augmentation of a frozen embedding model.
+
+    The embedding model is never retrained or fine-tuned; the temporal vector is
+    computed independently and appended. That is what keeps the approach
+    model-agnostic and lets the semantic model be swapped without touching the
+    temporal machinery.
+
+    Args:
+        embedding_client: Frozen semantic embedding model.
+        vector_store: Destination backend.
+        hierarchy: Scales and epoch. Must match the retriever's.
+        split_at_boundaries: Emit one representation per component arc when an
+            interval crosses a period boundary. Disabling this keeps one row per
+            chunk but lets long arcs saturate, which blurs boundary-crossing
+            documents.
+        max_representations: Ceiling on rows emitted for a single chunk.
     """
-    
+
     def __init__(
         self,
-        embedding_client: LlamaStackEmbeddingClient,
+        embedding_client,
         vector_store: VectorStore,
-        t0_seconds: float = T0_SECONDS,
-        period_seconds: float = None,  # Deprecated - multi-scale now
-        temporal_scale: float = 1.0
-    ):
-        """
-        Initialize ingestion pipeline.
-        
-        Args:
-            embedding_client: Client for obtaining semantic embeddings
-            vector_store: Vector database for storage
-            t0_seconds: Base epoch for timestamp normalization
-            period_seconds: Deprecated (multi-scale encoding used internally)
-            temporal_scale: Scaling factor for spin vector (default: 1.0)
-                           Note: Has no effect on cosine similarity (scale-invariant).
-                           Use β parameter in retrieval for temporal control instead.
-        """
+        hierarchy: TemporalHierarchy = DEFAULT_HIERARCHY,
+        split_at_boundaries: bool = True,
+        max_representations: int = MAX_REPRESENTATIONS,
+    ) -> None:
         self.embedding_client = embedding_client
         self.vector_store = vector_store
-        self.t0_seconds = t0_seconds
-        # period_seconds is deprecated - multi-scale encoding now used
-        self.temporal_scale = temporal_scale
-    
+        self.hierarchy = hierarchy
+        self.split_at_boundaries = split_at_boundaries
+        self.max_representations = max_representations
+
+        store_hierarchy = getattr(vector_store, "hierarchy", None)
+        if store_hierarchy is None and hasattr(vector_store, "set_hierarchy"):
+            vector_store.set_hierarchy(hierarchy)
+        elif store_hierarchy is not None and not hierarchy.is_compatible_with(store_hierarchy):
+            raise ValueError(
+                "ingestion hierarchy is incompatible with the vector store's:\n"
+                f"  pipeline: {hierarchy.fingerprint()}\n"
+                f"  store   : {store_hierarchy.fingerprint()}"
+            )
+
+    # ------------------------------------------------------------------
+    # Interval resolution
+    # ------------------------------------------------------------------
+
+    def resolve_interval(
+        self,
+        text: str,
+        interval: Optional[TemporalInterval] = None,
+        timestamp: Optional[datetime] = None,
+        end_timestamp: Optional[datetime] = None,
+    ) -> TemporalInterval:
+        """
+        Determine the half-open interval for a chunk.
+
+        Precedence: an explicit ``interval``, then an explicit ``timestamp``
+        (optionally with ``end_timestamp``), then extraction from the text. Text
+        extraction prefers a period — "Q3 2023" becomes the full quarter, not a
+        single instant — because a duration is what enables hierarchical matching
+        between a quarterly filing and an annual query.
+        """
+        if interval is not None:
+            return interval
+        if timestamp is not None:
+            return TemporalInterval(timestamp, end_timestamp)
+
+        extracted = extract_interval_from_text(text)
+        if extracted is not None:
+            return extracted
+        return TemporalInterval.point(
+            extract_timestamp_from_text(text, fallback=datetime.now(timezone.utc))
+        )
+
+    # ------------------------------------------------------------------
+    # Ingestion
+    # ------------------------------------------------------------------
+
     def ingest_document(
         self,
         text: str,
+        interval: Optional[TemporalInterval] = None,
         timestamp: Optional[datetime] = None,
+        end_timestamp: Optional[datetime] = None,
         doc_id: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
-        end_timestamp: Optional[datetime] = None
-    ) -> SpinDocument:
+    ) -> List[SpinDocument]:
         """
-        Ingest a single document with point or arc temporal encoding.
-        
-        Args:
-            text: Document text
-            timestamp: Start timestamp (if None, will be extracted)
-            doc_id: Optional document ID (if None, will be generated)
-            metadata: Optional metadata dictionary
-            end_timestamp: Optional end timestamp for arc mode (time period)
-        
-        Returns:
-            SpinDocument with embeddings and spin encoding (point or arc)
-        
-        Note:
-            - If end_timestamp is None: Point mode (instant in time)
-            - If end_timestamp is provided: Arc mode (time period/interval)
+        Ingest one chunk, returning every representation written.
+
+        The returned list has one entry per component arc; for an interval that
+        crosses no boundary it has exactly one.
         """
-        # Generate ID if not provided
-        if doc_id is None:
-            doc_id = str(uuid.uuid4())
-        
-        # Extract or infer timestamp
-        if timestamp is None:
-            timestamp = extract_timestamp_from_text(
-                text,
-                fallback=datetime.now(timezone.utc)
-            )
-        
-        # Ensure timezone-aware
-        if timestamp.tzinfo is None:
-            timestamp = timestamp.replace(tzinfo=timezone.utc)
-        
-        # Get semantic embedding from LlamaStack
-        semantic_embedding = self.embedding_client.embed_single(text)
-        
-        # Compute temporal spin vector (point or arc mode)
-        timestamp_seconds = timestamp.timestamp()
-        end_seconds = end_timestamp.timestamp() if end_timestamp else None
-        
-        spin_vector, phi_centers, phi_starts, phi_ends = compute_spin_vector(
-            timestamp_seconds,
-            self.t0_seconds,
-            period_seconds=None,  # Deprecated - multi-scale encoding
-            temporal_scale=self.temporal_scale,
-            end_timestamp_seconds=end_seconds
+        return self.ingest_batch(
+            texts=[text],
+            intervals=[interval],
+            timestamps=[timestamp],
+            end_timestamps=[end_timestamp],
+            doc_ids=[doc_id],
+            metadatas=[metadata],
         )
-        
-        # Concatenate: full_embedding = [semantic_embedding, spin_vector]
-        # spin_vector is now 9D (3 scales × 3D each)
-        full_embedding = semantic_embedding + spin_vector
-        
-        # Create SpinDocument
-        doc = SpinDocument(
-            doc_id=doc_id,
-            text=text,
-            timestamp=timestamp,
-            semantic_embedding=semantic_embedding,
-            spin_vector=spin_vector,
-            phi=phi_centers,  # Now a dict with keys 'quarter', 'decade', 'century'
-            full_embedding=full_embedding,
-            metadata=metadata or {},
-            end_timestamp=end_timestamp,
-            phi_start=phi_starts,  # Now a dict
-            phi_end=phi_ends,  # Now a dict
-            is_arc=(end_timestamp is not None)
-        )
-        
-        # Store in vector database
-        self.vector_store.add_documents([doc])
-        
-        return doc
-    
+
     def ingest_batch(
         self,
-        texts: List[str],
-        timestamps: Optional[List[datetime]] = None,
-        doc_ids: Optional[List[str]] = None,
-        metadatas: Optional[List[Dict[str, Any]]] = None,
-        end_timestamps: Optional[List[Optional[datetime]]] = None
+        texts: Sequence[str],
+        intervals: Optional[Sequence[Optional[TemporalInterval]]] = None,
+        timestamps: Optional[Sequence[Optional[datetime]]] = None,
+        end_timestamps: Optional[Sequence[Optional[datetime]]] = None,
+        doc_ids: Optional[Sequence[Optional[str]]] = None,
+        metadatas: Optional[Sequence[Optional[Dict[str, Any]]]] = None,
     ) -> List[SpinDocument]:
         """
-        Ingest multiple documents in a batch (more efficient).
-        
-        Args:
-            texts: List of document texts
-            timestamps: Optional list of start timestamps (None = auto-extract)
-            doc_ids: Optional list of document IDs
-            metadatas: Optional list of metadata dicts
-            end_timestamps: Optional list of end timestamps for arc mode (None = point mode)
-        
-        Returns:
-            List of SpinDocument objects
+        Ingest many chunks with a single batched embedding call.
+
+        Returns every representation written, flattened. The count can exceed
+        ``len(texts)`` when chunks are split at boundaries — check ``group_id`` to
+        recover the original grouping.
         """
         n = len(texts)
-        
-        # Handle optional arguments
-        if timestamps is None:
-            timestamps = [None] * n
-        if doc_ids is None:
-            doc_ids = [str(uuid.uuid4()) for _ in range(n)]
-        if metadatas is None:
-            metadatas = [{}] * n
-        if end_timestamps is None:
-            end_timestamps = [None] * n
-        
-        # Extract timestamps where needed
-        resolved_timestamps = []
-        for i, (text, ts) in enumerate(zip(texts, timestamps)):
-            if ts is None:
-                ts = extract_timestamp_from_text(
-                    text,
-                    fallback=datetime.now(timezone.utc)
-                )
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-            resolved_timestamps.append(ts)
-        
-        # Batch embedding request (efficient!)
-        semantic_embeddings = self.embedding_client.embed(texts)
-        
-        # Create SpinDocument objects
-        documents = []
+        intervals = list(intervals) if intervals else [None] * n
+        timestamps = list(timestamps) if timestamps else [None] * n
+        end_timestamps = list(end_timestamps) if end_timestamps else [None] * n
+        doc_ids = list(doc_ids) if doc_ids else [None] * n
+        metadatas = list(metadatas) if metadatas else [None] * n
+
+        resolved = [
+            self.resolve_interval(texts[i], intervals[i], timestamps[i], end_timestamps[i])
+            for i in range(n)
+        ]
+
+        # One batched call to the frozen embedding model.
+        embeddings = self.embedding_client.embed(list(texts))
+
+        documents: List[SpinDocument] = []
         for i in range(n):
-            # Compute spin vector (point or arc mode)
-            timestamp_seconds = resolved_timestamps[i].timestamp()
-            end_seconds = end_timestamps[i].timestamp() if end_timestamps[i] else None
-            
-            spin_vector, phi_centers, phi_starts, phi_ends = compute_spin_vector(
-                timestamp_seconds,
-                self.t0_seconds,
-                period_seconds=None,  # Deprecated - multi-scale encoding
-                temporal_scale=self.temporal_scale,
-                end_timestamp_seconds=end_seconds
+            group_id = doc_ids[i] or str(uuid.uuid4())
+            encodings = encode(
+                resolved[i],
+                self.hierarchy,
+                group_id=group_id,
+                split=self.split_at_boundaries,
+                max_representations=self.max_representations,
             )
-            
-            # Concatenate (spin vector is now 9D for multi-scale)
-            full_embedding = semantic_embeddings[i] + spin_vector
-            
-            # Create document
-            doc = SpinDocument(
-                doc_id=doc_ids[i],
-                text=texts[i],
-                timestamp=resolved_timestamps[i],
-                semantic_embedding=semantic_embeddings[i],
-                spin_vector=spin_vector,
-                phi=phi_centers,  # Dict with keys 'quarter', 'decade', 'century'
-                full_embedding=full_embedding,
-                metadata=metadatas[i],
-                end_timestamp=end_timestamps[i],
-                phi_start=phi_starts,  # Dict
-                phi_end=phi_ends,  # Dict
-                is_arc=(end_timestamps[i] is not None)
-            )
-            documents.append(doc)
-        
-        # Batch insert into vector store
+
+            base_metadata = dict(metadatas[i] or {})
+            for encoding in encodings:
+                # A split chunk needs distinct primary keys but one shared identity.
+                doc_id = (
+                    group_id
+                    if encoding.representation_count == 1
+                    else f"{group_id}#{encoding.representation_index}"
+                )
+                metadata = dict(base_metadata)
+                metadata.update(
+                    {
+                        "group_id": group_id,
+                        "representation_index": encoding.representation_index,
+                        "representation_count": encoding.representation_count,
+                    }
+                )
+                documents.append(
+                    SpinDocument(
+                        doc_id=doc_id,
+                        text=texts[i],
+                        semantic_embedding=embeddings[i],
+                        encoding=encoding,
+                        group_id=group_id,
+                        metadata=metadata,
+                    )
+                )
+
+            if len(encodings) > 1:
+                logger.debug(
+                    "chunk %s spans %s and crosses %d boundary/ies -> %d representations",
+                    group_id,
+                    resolved[i],
+                    len(encodings) - 1,
+                    len(encodings),
+                )
+
         self.vector_store.add_documents(documents)
-        
+        logger.info(
+            "ingested %d chunk(s) as %d representation(s) under %s",
+            n,
+            len(documents),
+            self.hierarchy.fingerprint(),
+        )
         return documents
-    
+
     def ingest_from_files(
         self,
-        file_paths: List[str],
-        extract_timestamp_from_filename: bool = True
+        file_paths: Sequence[str],
+        extract_interval_from_filename: bool = True,
     ) -> List[SpinDocument]:
         """
-        Ingest documents from files.
-        
-        Args:
-            file_paths: List of file paths to ingest
-            extract_timestamp_from_filename: Try to parse timestamp from filename
-        
-        Returns:
-            List of ingested SpinDocument objects
+        Ingest whole files, deriving the interval from the filename, then the
+        content, then the file's modification time.
         """
-        texts = []
-        timestamps = []
-        doc_ids = []
-        metadatas = []
-        
-        for file_path in file_paths:
-            # Read file
-            with open(file_path, 'r', encoding='utf-8') as f:
-                text = f.read()
-            
-            # Try to extract timestamp
-            timestamp = None
-            if extract_timestamp_from_filename:
-                filename = os.path.basename(file_path)
-                try:
-                    timestamp = extract_timestamp_from_text(filename)
-                except Exception:
-                    pass
-            
-            # Fallback to file modification time
-            if timestamp is None:
-                mtime = os.path.getmtime(file_path)
-                timestamp = datetime.fromtimestamp(mtime, tz=timezone.utc)
-            
+        texts: List[str] = []
+        intervals: List[Optional[TemporalInterval]] = []
+        doc_ids: List[str] = []
+        metadatas: List[Dict[str, Any]] = []
+
+        for path in file_paths:
+            with open(path, "r", encoding="utf-8") as handle:
+                text = handle.read()
+
+            interval: Optional[TemporalInterval] = None
+            if extract_interval_from_filename:
+                interval = extract_interval_from_text(os.path.basename(path))
+            if interval is None:
+                interval = extract_interval_from_text(text)
+            if interval is None:
+                mtime = datetime.fromtimestamp(os.path.getmtime(path), tz=timezone.utc)
+                interval = TemporalInterval.point(mtime)
+
             texts.append(text)
-            timestamps.append(timestamp)
-            doc_ids.append(file_path)  # Use file path as ID
-            metadatas.append({"file_path": file_path})
-        
-        return self.ingest_batch(texts, timestamps, doc_ids, metadatas)
+            intervals.append(interval)
+            doc_ids.append(path)
+            metadatas.append({"file_path": path})
+
+        return self.ingest_batch(
+            texts=texts, intervals=intervals, doc_ids=doc_ids, metadatas=metadatas
+        )
 
 
 def create_ingestion_pipeline(
@@ -291,34 +272,17 @@ def create_ingestion_pipeline(
     llamastack_url: Optional[str] = None,
     model_name: str = "text-embedding-v1",
     use_mock_embeddings: bool = False,
-    embedding_dim: int = 384
+    embedding_dim: int = 384,
+    hierarchy: TemporalHierarchy = DEFAULT_HIERARCHY,
 ) -> TemporalSpinIngestionPipeline:
-    """
-    Convenience factory to create an ingestion pipeline.
-    
-    Args:
-        vector_store: Vector database instance
-        llamastack_url: LlamaStack API URL (or use LLAMASTACK_URL env var)
-        model_name: Embedding model name
-        use_mock_embeddings: Use mock embeddings for testing
-        embedding_dim: Embedding dimension (for mock client)
-    
-    Returns:
-        Configured TemporalSpinIngestionPipeline
-    """
-    if use_mock_embeddings:
-        embedding_client = MockEmbeddingClient(
-            model_name="mock-embed",
-            dimension=embedding_dim
-        )
-    else:
-        embedding_client = LlamaStackEmbeddingClient(
-            base_url=llamastack_url,
-            model_name=model_name
-        )
-    
-    return TemporalSpinIngestionPipeline(
-        embedding_client=embedding_client,
-        vector_store=vector_store
-    )
+    """Convenience factory wiring an embedding client to a pipeline."""
+    from llamastack_client import LlamaStackEmbeddingClient, MockEmbeddingClient
 
+    if use_mock_embeddings:
+        client = MockEmbeddingClient(model_name="mock-embed", dimension=embedding_dim)
+    else:
+        client = LlamaStackEmbeddingClient(base_url=llamastack_url, model_name=model_name)
+
+    return TemporalSpinIngestionPipeline(
+        embedding_client=client, vector_store=vector_store, hierarchy=hierarchy
+    )

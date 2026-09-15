@@ -4,31 +4,31 @@ Mock Dataset Generator for Temporal Spin Retrieval Demo
 
 Generates realistic mock financial reports for IBM spanning 2015-2024.
 Each report includes:
-- Unique timestamp (year-specific)
+- A temporal interval (the fiscal year it covers)
 - Financial metrics with year-over-year variations
 - Revenue, profit, and strategic initiative data
 - Natural language suitable for semantic search
+
+An annual report is a *period*, not an instant. Encoding one as a point at
+31 December collapses twelve months onto a single phase and makes it look, to a
+Q1 query, like a December document rather than a document covering Q1. Prefer
+:func:`generate_ibm_report_intervals`; :func:`generate_ibm_reports` is retained
+for callers still working in point mode.
+
+The set also includes one multi-year review document, which crosses 1-year period
+boundaries and therefore demonstrates boundary splitting into several
+representations sharing a ``group_id``.
 """
 
 from datetime import datetime, timezone
 from typing import List, Tuple
-import random
+
+from temporal_encoding import TemporalInterval
 
 
-def generate_ibm_reports() -> List[Tuple[str, datetime]]:
-    """
-    Generate 10 mock IBM financial reports (2015-2024).
-    
-    Each report includes:
-    - Clear date indicators ("for the period ended December 31, YYYY")
-    - Revenue and profit figures that evolve over time
-    - Strategic initiatives and technology focus areas
-    - Natural language suitable for embedding
-    
-    Returns:
-        List of (text, timestamp) tuples
-    """
-    
+def _build_reports() -> List[Tuple[str, int]]:
+    """Generate the report texts paired with the fiscal year each one covers."""
+
     # Base financial data with realistic year-over-year changes
     financial_data = [
         # (year, revenue_billions, net_income_billions, strategic_focus)
@@ -46,12 +46,9 @@ def generate_ibm_reports() -> List[Tuple[str, datetime]]:
     
     reports = []
     
-    for year, revenue, net_income, strategic_focus in financial_data:
-        # Create timestamp (December 31 of each year)
-        timestamp = datetime(year, 12, 31, tzinfo=timezone.utc)
-        
+    for index, (year, revenue, net_income, strategic_focus) in enumerate(financial_data):
         # Calculate growth rates
-        prev_revenue = financial_data[financial_data.index((year, revenue, net_income, strategic_focus)) - 1][1] if year > 2015 else revenue
+        prev_revenue = financial_data[index - 1][1] if index > 0 else revenue
         revenue_growth = ((revenue - prev_revenue) / prev_revenue) * 100 if year > 2015 else 0
         
         # Generate report text
@@ -103,18 +100,97 @@ through continued focus on high-value segments and emerging technologies.
 For more information, visit ibm.com/investor or contact IBM Investor Relations.
 """.strip()
         
-        reports.append((text, timestamp))
-    
+        reports.append((text, year))
+
     return reports
 
 
-def generate_query_examples() -> List[Tuple[str, datetime, str]]:
+def generate_ibm_report_intervals(
+    include_multi_year: bool = True,
+) -> List[Tuple[str, TemporalInterval]]:
     """
-    Generate example queries for demonstrating temporal spin retrieval.
-    
+    Generate the IBM reports paired with the fiscal-year interval each covers.
+
+    Args:
+        include_multi_year: Append a 2017-2022 review document. It crosses five
+            1-year boundaries, so ingestion splits it into six representations
+            under one ``group_id`` — the boundary-splitting path in miniature.
+
     Returns:
-        List of (query_text, query_timestamp, description) tuples
+        List of ``(text, TemporalInterval)`` tuples.
     """
+    reports = [(text, TemporalInterval.of_year(year)) for text, year in _build_reports()]
+
+    if include_multi_year:
+        reports.append(
+            (
+                "IBM Corporation Six-Year Strategic Review, 2017-2022\n\n"
+                "This review covers the period from 2017 through 2022, spanning the "
+                "Red Hat acquisition, the Kyndryl separation, and the pivot to hybrid "
+                "cloud and AI. Revenue moved from $79.1 billion in 2017 to $60.5 "
+                "billion in 2022, reflecting the divestiture of the managed "
+                "infrastructure business rather than a contraction in demand.",
+                TemporalInterval.spanning(2017, 2022),
+            )
+        )
+
+    return reports
+
+
+def generate_ibm_reports() -> List[Tuple[str, datetime]]:
+    """
+    Point-mode view of the dataset, one timestamp per report.
+
+    Kept for callers that predate interval encoding. New code should use
+    :func:`generate_ibm_report_intervals` — a year-long arc is what lets an annual
+    report answer a quarterly query.
+    """
+    return [
+        (text, datetime(year, 12, 31, tzinfo=timezone.utc))
+        for text, year in _build_reports()
+    ]
+
+
+def generate_query_examples() -> List[Tuple[str, TemporalInterval, str]]:
+    """
+    Example queries for demonstrating temporal spin retrieval.
+
+    Returns:
+        List of ``(query_text, interval, description)`` tuples.
+    """
+    return [
+        (
+            "IBM revenue and financial performance",
+            TemporalInterval.of_quarter(2016, 2),
+            "Q2 2016 - should prioritise the 2016 report; 2015 and 2017 coincide "
+            "on the 1-year circle and are separated by the 16-year circle",
+        ),
+        (
+            "IBM cloud computing strategy and growth",
+            TemporalInterval.of_year(2019),
+            "FY2019 - Red Hat acquisition era",
+        ),
+        (
+            "IBM artificial intelligence and Watson capabilities",
+            TemporalInterval.of_year(2015),
+            "FY2015 - Watson AI focus period",
+        ),
+        (
+            "IBM hybrid cloud platform and enterprise solutions",
+            TemporalInterval.spanning(2020, 2022),
+            "A three-year span - matches the multi-year review through several of "
+            "its split representations, deduplicated back to one hit",
+        ),
+        (
+            "IBM quantum computing and generative AI",
+            TemporalInterval.of_quarter(2024, 3),
+            "Q3 2024 - quantum and gen AI focus",
+        ),
+    ]
+
+
+def generate_point_query_examples() -> List[Tuple[str, datetime, str]]:
+    """Point-mode example queries, retained for the legacy demo path."""
     queries = [
         (
             "IBM revenue and financial performance",
@@ -146,12 +222,12 @@ def generate_query_examples() -> List[Tuple[str, datetime, str]]:
     return queries
 
 
-def print_dataset_summary(reports: List[Tuple[str, datetime]]) -> None:
+def print_dataset_summary(reports: List[Tuple[str, TemporalInterval]]) -> None:
     """
     Print a summary of the generated dataset.
-    
+
     Args:
-        reports: List of (text, timestamp) tuples
+        reports: List of ``(text, interval)`` tuples.
     """
     print("=" * 80)
     print("TEMPORAL SPIN RETRIEVAL - DEMO DATASET")
@@ -159,33 +235,31 @@ def print_dataset_summary(reports: List[Tuple[str, datetime]]) -> None:
     print()
     print(f"Total Reports: {len(reports)}")
     print()
-    print("Report Timestamps:")
-    print("-" * 40)
-    for i, (text, timestamp) in enumerate(reports, 1):
-        # Extract year and revenue from text
-        year = timestamp.year
-        revenue_line = [line for line in text.split('\n') if 'Total Revenue:' in line][0]
-        print(f"{i:2d}. {year} - {revenue_line.strip()}")
+    print("Report Periods:")
+    print("-" * 60)
+    for i, (text, interval) in enumerate(reports, 1):
+        revenue_lines = [line for line in text.split("\n") if "Total Revenue:" in line]
+        detail = revenue_lines[0].strip() if revenue_lines else text.split("\n")[0].strip()
+        end = interval.end.date() if interval.end else interval.start.date()
+        print(f"{i:2d}. [{interval.start.date()} -> {end})  {detail}")
     print()
     print("=" * 80)
 
 
 if __name__ == "__main__":
-    # Generate and display dataset
-    reports = generate_ibm_reports()
+    reports = generate_ibm_report_intervals()
     print_dataset_summary(reports)
-    
+
     print("\nSample Report (2019):")
     print("-" * 80)
-    sample_report = [r for r in reports if r[1].year == 2019][0]
-    print(sample_report[0][:500] + "...\n")
-    
+    sample = [r for r in reports if r[1].start.year == 2019][0]
+    print(sample[0][:500] + "...\n")
+
     print("\nExample Queries:")
     print("-" * 80)
-    queries = generate_query_examples()
-    for i, (query, timestamp, description) in enumerate(queries, 1):
-        print(f"{i}. Query: \"{query}\"")
-        print(f"   Timestamp: {timestamp.date()}")
+    for i, (query, interval, description) in enumerate(generate_query_examples(), 1):
+        print(f'{i}. Query: "{query}"')
+        print(f"   Period:   {interval}")
         print(f"   Expected: {description}")
         print()
 

@@ -1,496 +1,556 @@
 """
-Temporal-Phase Spin Retrieval System
-=====================================
+Temporal-Phase Spin Retrieval — Public Surface
+==============================================
 
-This module implements a novel retrieval algorithm that encodes time as an angular
-spin state on the unit circle, enabling smooth temporal zoom without model retraining.
+Hierarchical phase-encoded temporal vectors for semantic embeddings.
 
-Core Concept:
--------------
-- Each document's timestamp is mapped to an angle φ ∈ [0, 2π) via a periodic function
-- Time becomes a 2D spin vector: [cos(φ), sin(φ)]
-- Concatenated with semantic embeddings: v_full = [v_semantic, spin_vector]
-- At query time, β (zoom factor) controls temporal alignment weighting
-
-No Model Retraining Required:
-------------------------------
-The semantic embedding model is frozen. Time encoding happens in the vector space
-via geometric augmentation, making this approach model-agnostic.
-
-Temporal Zoom:
+What this does
 --------------
-β acts as a "zoom knob":
-  - β = 0: Pure semantic search (time ignored)
-  - β = 100: Weak temporal preference
-  - β = 1000: Moderate temporal focus
-  - β = 5000: Strong temporal focus (exact year prioritized) [DEFAULT]
-  - β = 10000+: Extreme temporal filter
-  - score = semantic_sim × exp(-β × (Δφ)²)
+
+A frozen embedding model turns text into a semantic vector that captures *what* a
+document says but nothing about *when* it says it. Two quarterly revenue reports
+three years apart are near-identical in that space. This package encodes the "when"
+as a continuous geometric phase on several concurrent circles, and concatenates the
+result onto the semantic vector:
+
+    modified_vector = [ semantic_embedding (N-D) , temporal_vector (3 x scales) ]
+
+No retraining, no fine-tuning, no metadata joins. The temporal discrimination is
+arithmetic, so it composes with any embedding model and any vector database.
+
+The circles
+-----------
+
+Three concurrent periodic scales, each an integer power of two and a factor of the
+next:
+
+===========  ========  ==========================  =====================
+Scale        Period    Divided into                Resolves
+===========  ========  ==========================  =====================
+``quarter``     1 y    4 calendar quarters         position within a year
+``decade``     16 y    16 calendar years           which year
+``century``   256 y    16 sixteen-year blocks      which era
+===========  ========  ==========================  =====================
+
+Each contributes ``[cos, sin, z]`` — the arc centre's phase components plus the arc
+length — giving a nine-dimensional temporal vector. ``z = 0`` marks a single instant
+(*point mode*); ``z > 0`` marks a duration (*arc mode*).
+
+The hierarchy is not fixed at three. It is variable-length and self-describing: see
+:class:`~temporal_config.TemporalHierarchy` and its ``extended`` method for adding a
+4096-year circle past 2155.
+
+Module map
+----------
+
+``temporal_config``
+    Epoch, scales, segments, weights, schema version, epoch-migration checks.
+``temporal_encoding``
+    Intervals, Formula 1, arc algebra, segments, boundary splitting, lazy traversal.
+``temporal_spin`` (this module)
+    Document/query/result types and timestamp extraction.
+``ingestion`` / ``retrieval`` / ``vector_store``
+    Pipeline, two-pass search, storage backends.
+``query_decomposition``
+    Natural-language temporal parsing and multi-subquery decomposition.
 """
+
+from __future__ import annotations
 
 import math
 import re
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import List, Tuple, Optional, Dict, Any
-from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
 from dateutil import parser as dateutil_parser
 
+from temporal_config import (
+    CENTURY_SCALE,
+    DECADE_SCALE,
+    DEFAULT_HIERARCHY,
+    EPOCH_1900,
+    EPOCH_2010_LEGACY,
+    MILLENNIUM_SCALE,
+    QUARTER_SCALE,
+    SCHEMA_VERSION,
+    TAU,
+    ScaleSpec,
+    TemporalHierarchy,
+    describe_epoch_migration,
+    epoch_shift_is_congruent,
+    floored_mod,
+    years_since_epoch,
+)
+from temporal_encoding import (
+    EPS,
+    MAX_REPRESENTATIONS,
+    ScaleMatch,
+    ScaleTuple,
+    TemporalEncoding,
+    TemporalInterval,
+    TraversalPlan,
+    angular_difference,
+    arc_contains_point,
+    arc_overlap,
+    encode,
+    encode_single,
+    encode_tuple,
+    evaluate_scale,
+    jaccard_arcs,
+    pad_to_hierarchy,
+    phase_of,
+    segment_label,
+    segments_intersected,
+    split_at_boundaries,
+    temporal_alignment,
+    traversal_plan,
+)
 
-# ============================================================================
-# Configuration Constants
-# ============================================================================
-
-# Base epoch for timestamp normalization (2010-01-01 00:00:00 UTC)
-T0_EPOCH = datetime(2010, 1, 1, tzinfo=timezone.utc)
-T0_SECONDS = T0_EPOCH.timestamp()
-
-# Multi-scale temporal encoding periods
-# Three scales for hierarchical temporal resolution:
-#   - QUARTER_SCALE: 1 year (quarterly precision within a year)
-#   - DECADE_SCALE: 16 years (year-to-year discrimination)
-#   - CENTURY_SCALE: 256 years (historical context)
-# Powers of 2 maintain mathematical consistency across scales
-QUARTER_SCALE_YEARS = 1
-DECADE_SCALE_YEARS = 16
-CENTURY_SCALE_YEARS = 256
-
-QUARTER_PERIOD_SECONDS = QUARTER_SCALE_YEARS * 365.25 * 24 * 3600
-DECADE_PERIOD_SECONDS = DECADE_SCALE_YEARS * 365.25 * 24 * 3600
-CENTURY_PERIOD_SECONDS = CENTURY_SCALE_YEARS * 365.25 * 24 * 3600
-
-# Weights for multi-scale temporal alignment
-# Decade scale gets highest weight for year-to-year queries
-QUARTER_WEIGHT = 0.4  # Within-year precision
-DECADE_WEIGHT = 0.5   # Year discrimination (highest)
-CENTURY_WEIGHT = 0.1  # Historical context
-
-# Default embedding dimension (adjust based on your model)
-DEFAULT_EMBEDDING_DIM = 384
-
-
-# ============================================================================
-# Temporal Spin Encoding (Point and Arc)
-# ============================================================================
-
-def compute_spin_vector(
-    timestamp_seconds: float,
-    t0_seconds: float = T0_SECONDS,
-    period_seconds: float = None,  # Deprecated - now uses multi-scale
-    phase_offset: float = 0.0,
-    temporal_scale: float = 1.0,
-    end_timestamp_seconds: Optional[float] = None
-) -> Tuple[List[float], Dict[str, float], Dict[str, Optional[float]], Dict[str, Optional[float]]]:
-    """
-    Map a timestamp (or time interval) to a multi-scale temporal spin vector.
-    
-    Multi-scale encoding with 3 hierarchical periods (powers of 2):
-    - Quarter scale (1 year): For quarterly precision within a year
-    - Decade scale (16 years): For year-to-year discrimination  
-    - Century scale (256 years): For historical context
-    
-    Supports two modes (both return 9D vectors for consistent dimensionality):
-    1. Point mode: Single timestamp → 9D vector [x_q, y_q, 0, x_d, y_d, 0, x_c, y_c, 0]
-    2. Arc mode: Time period → 9D vector with arc_length in z components
-    
-    Args:
-        timestamp_seconds: Unix timestamp in seconds (start time for arcs)
-        t0_seconds: Base epoch timestamp (default: 2010-01-01)
-        period_seconds: Deprecated (kept for backward compatibility, ignored)
-        phase_offset: Optional phase shift in radians
-        temporal_scale: Scaling factor for spin vector magnitude (default: 1.0)
-        end_timestamp_seconds: Optional end timestamp for arc mode. If None, uses point mode.
-    
-    Returns:
-        Tuple of (spin_vector, phi_centers, phi_starts, phi_ends):
-        - spin_vector: Always 9D [x_q, y_q, z_q, x_d, y_d, z_d, x_c, y_c, z_c]
-        - phi_centers: Dict with keys 'quarter', 'decade', 'century'
-        - phi_starts: Dict with start angles for each scale (None for points)
-        - phi_ends: Dict with end angles for each scale (None for points)
-    
-    Examples:
-        >>> # Point mode - single instant in time
-        >>> t = datetime(2023, 6, 15, tzinfo=timezone.utc).timestamp()
-        >>> spin, phi_c, phi_s, phi_e = compute_spin_vector(t)
-        >>> len(spin)  # Returns 9
-        9
-        
-        >>> # Arc mode - Q1 2023 (period)
-        >>> t_start = datetime(2023, 1, 1, tzinfo=timezone.utc).timestamp()
-        >>> t_end = datetime(2023, 3, 31, tzinfo=timezone.utc).timestamp()
-        >>> spin, phi_c, phi_s, phi_e = compute_spin_vector(t_start, end_timestamp_seconds=t_end)
-        >>> # Quarter scale will show ~90° arc, decade/century scales show smaller arcs
-    """
-    periods = {
-        'quarter': QUARTER_PERIOD_SECONDS,
-        'decade': DECADE_PERIOD_SECONDS,
-        'century': CENTURY_PERIOD_SECONDS
-    }
-    
-    spin_vector = []
-    phi_centers = {}
-    phi_starts = {}
-    phi_ends = {}
-    
-    # Encode at each scale
-    for scale_name in ['quarter', 'decade', 'century']:
-        period_sec = periods[scale_name]
-        
-        # Point mode: Single timestamp
-        if end_timestamp_seconds is None:
-            # Normalize time to [0, 1) fractional position within period
-            fraction = ((timestamp_seconds - t0_seconds) / period_sec) % 1.0
-            
-            # Convert to angle: φ ∈ [0, 2π)
-            phi = math.tau * fraction + phase_offset
-            
-            # Spin vector on unit circle (3D with arc_length=0 for points)
-            cos_phi = math.cos(phi)
-            sin_phi = math.sin(phi)
-            spin_vector.extend([
-                temporal_scale * cos_phi,
-                temporal_scale * sin_phi,
-                0.0  # No arc length for points
-            ])
-            
-            phi_centers[scale_name] = phi
-            phi_starts[scale_name] = None
-            phi_ends[scale_name] = None
-        
-        # Arc mode: Start and end timestamps
-        else:
-            # Compute start and end angles at this scale
-            fraction_start = ((timestamp_seconds - t0_seconds) / period_sec) % 1.0
-            fraction_end = ((end_timestamp_seconds - t0_seconds) / period_sec) % 1.0
-            
-            phi_start = math.tau * fraction_start + phase_offset
-            phi_end = math.tau * fraction_end + phase_offset
-            
-            # Handle wrapping: if end < start, arc crosses 0°
-            if phi_end < phi_start:
-                phi_end += math.tau
-            
-            # Compute arc center and length
-            phi_center = (phi_start + phi_end) / 2.0
-            arc_length = phi_end - phi_start
-            
-            # Normalize phi_center back to [0, 2π)
-            phi_center = phi_center % math.tau
-            
-            # Spin vector for arcs (3D: center + arc_length)
-            cos_center = math.cos(phi_center)
-            sin_center = math.sin(phi_center)
-            spin_vector.extend([
-                temporal_scale * cos_center,
-                temporal_scale * sin_center,
-                arc_length  # Arc length in radians (not scaled)
-            ])
-            
-            phi_centers[scale_name] = phi_center
-            phi_starts[scale_name] = phi_start
-            phi_ends[scale_name] = phi_end
-    
-    return spin_vector, phi_centers, phi_starts, phi_ends
-
-
-def angular_difference(phi1: float, phi2: float) -> float:
-    """
-    Compute the smallest angular difference between two angles.
-    
-    Returns Δφ ∈ [0, π] (always the shortest arc on the circle).
-    
-    Args:
-        phi1, phi2: Angles in radians
-    
-    Returns:
-        Smallest angular distance in radians
-    """
-    diff = abs(phi1 - phi2) % math.tau
-    return min(diff, math.tau - diff)
-
-
-def arc_overlap(phi_start1: float, phi_end1: float, 
-                phi_start2: float, phi_end2: float) -> float:
-    """
-    Compute the overlap (intersection) between two arcs on the unit circle.
-    
-    Arcs are defined by [phi_start, phi_end]. This function handles wrapping.
-    
-    Args:
-        phi_start1, phi_end1: First arc (start and end angles in radians)
-        phi_start2, phi_end2: Second arc
-    
-    Returns:
-        Overlap length in radians [0, 2π]
-    
-    Example:
-        >>> # Two arcs covering Q1 and Q2 of a year
-        >>> q1_start, q1_end = 0.0, math.pi/2
-        >>> q2_start, q2_end = math.pi/2, math.pi
-        >>> overlap = arc_overlap(q1_start, q1_end, q2_start, q2_end)
-        >>> # Returns 0.0 (adjacent, no overlap)
-    """
-    # Normalize all angles to [0, 2π)
-    phi_start1 = phi_start1 % math.tau
-    phi_end1 = phi_end1 % math.tau
-    phi_start2 = phi_start2 % math.tau
-    phi_end2 = phi_end2 % math.tau
-    
-    # Handle wrapping for arc 1
-    if phi_end1 < phi_start1:
-        phi_end1 += math.tau
-    
-    # Handle wrapping for arc 2
-    if phi_end2 < phi_start2:
-        phi_end2 += math.tau
-    
-    # Find intersection
-    intersection_start = max(phi_start1, phi_start2)
-    intersection_end = min(phi_end1, phi_end2)
-    
-    if intersection_end > intersection_start:
-        return intersection_end - intersection_start
-    else:
-        return 0.0
-
-
-def jaccard_similarity_arcs(phi_start1: float, phi_end1: float,
-                            phi_start2: float, phi_end2: float) -> float:
-    """
-    Compute Jaccard similarity between two arcs on the unit circle.
-    
-    Jaccard = |intersection| / |union|
-    
-    Args:
-        phi_start1, phi_end1: First arc
-        phi_start2, phi_end2: Second arc
-    
-    Returns:
-        Jaccard similarity in [0, 1]
-    
-    Example:
-        >>> # Annual report (full year) vs Q2 (quarter)
-        >>> year_start, year_end = 0.0, 2*math.pi
-        >>> q2_start, q2_end = math.pi/2, math.pi
-        >>> sim = jaccard_similarity_arcs(year_start, year_end, q2_start, q2_end)
-        >>> # Returns 0.25 (quarter is 25% of year)
-    """
-    # Compute arc lengths
-    arc1_length = (phi_end1 - phi_start1) % math.tau
-    arc2_length = (phi_end2 - phi_start2) % math.tau
-    
-    # Compute intersection
-    intersection = arc_overlap(phi_start1, phi_end1, phi_start2, phi_end2)
-    
-    # Compute union
-    union = arc1_length + arc2_length - intersection
-    
-    if union == 0:
-        return 0.0
-    
-    return intersection / union
-
-
-# ============================================================================
-# Timestamp Extraction
-# ============================================================================
-
-# Common date patterns in financial/corporate documents
-DATE_PATTERNS = [
-    # "for the period ended 31 December 2019"
-    r'period\s+ended\s+(\d{1,2}\s+\w+\s+\d{4})',
-    # "as of December 31, 2019"
-    r'as\s+of\s+(\w+\s+\d{1,2},?\s+\d{4})',
-    # "fiscal year 2019"
-    r'fiscal\s+year\s+(\d{4})',
-    # "Q4 2019", "Q1 2020"
-    r'Q[1-4]\s+(\d{4})',
-    # ISO format: "2019-12-31"
-    r'(\d{4}-\d{2}-\d{2})',
-    # US format: "12/31/2019"
-    r'(\d{1,2}/\d{1,2}/\d{4})',
+__all__ = [
+    # configuration
+    "TemporalHierarchy",
+    "ScaleSpec",
+    "DEFAULT_HIERARCHY",
+    "EPOCH_1900",
+    "EPOCH_2010_LEGACY",
+    "QUARTER_SCALE",
+    "DECADE_SCALE",
+    "CENTURY_SCALE",
+    "MILLENNIUM_SCALE",
+    "SCHEMA_VERSION",
+    "describe_epoch_migration",
+    "epoch_shift_is_congruent",
+    # encoding
+    "TemporalInterval",
+    "TemporalEncoding",
+    "ScaleTuple",
+    "ScaleMatch",
+    "TraversalPlan",
+    "encode",
+    "encode_single",
+    "encode_tuple",
+    "phase_of",
+    "floored_mod",
+    "split_at_boundaries",
+    "traversal_plan",
+    "evaluate_scale",
+    "temporal_alignment",
+    "angular_difference",
+    "arc_overlap",
+    "arc_contains_point",
+    "jaccard_arcs",
+    "pad_to_hierarchy",
+    # documents
+    "SpinDocument",
+    "SpinQuery",
+    "RetrievalResult",
+    "extract_timestamp_from_text",
+    "extract_interval_from_text",
+    "cosine_similarity",
+    "normalize_vector",
+    "deduplicate_by_group",
 ]
 
 
+# ============================================================================
+# Timestamp extraction
+# ============================================================================
+
+# Common date patterns in financial and corporate documents, most specific first.
+DATE_PATTERNS = [
+    r"period\s+ended\s+(\d{1,2}\s+\w+\s+\d{4})",
+    r"as\s+of\s+(\w+\s+\d{1,2},?\s+\d{4})",
+    r"fiscal\s+year\s+(\d{4})",
+    r"Q[1-4]\s+(\d{4})",
+    r"(\d{4}-\d{2}-\d{2})",
+    r"(\d{1,2}/\d{1,2}/\d{4})",
+]
+
+_QUARTER_RE = re.compile(r"\bQ([1-4])[\s,/-]*((?:FY)?\s*\d{4})\b", re.IGNORECASE)
+_FY_RE = re.compile(r"\b(?:fiscal\s+year|FY)\s*(\d{4})\b", re.IGNORECASE)
+_YEAR_RANGE_RE = re.compile(r"\b(\d{4})\s*(?:-|–|—|to|through)\s*(\d{4})\b")
+_BARE_YEAR_RE = re.compile(r"\b(19|20|21)(\d{2})\b")
+
+
 def extract_timestamp_from_text(
-    text: str,
-    fallback: Optional[datetime] = None
+    text: str, fallback: Optional[datetime] = None
 ) -> datetime:
     """
-    Extract timestamp from document text using regex patterns and dateutil.
-    
-    Strategy:
-    1. Try regex patterns for common corporate/financial date formats
-    2. Use dateutil fuzzy parsing as fallback
-    3. Use provided fallback or current time if all else fails
-    
-    Args:
-        text: Document text to parse
-        fallback: Fallback datetime if extraction fails
-    
-    Returns:
-        Extracted datetime (timezone-aware UTC)
+    Best-effort single timestamp from document text.
+
+    Tries the corporate/financial date patterns first, then dateutil fuzzy parsing,
+    then the supplied fallback. Prefer :func:`extract_interval_from_text` when the
+    document describes a *period* rather than an instant — encoding a quarterly
+    report as a point discards the duration that makes hierarchical matching work.
     """
-    # Try each regex pattern
     for pattern in DATE_PATTERNS:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
-            date_str = match.group(1)
             try:
-                # Parse the extracted date string
-                dt = dateutil_parser.parse(date_str, fuzzy=True)
-                # Ensure UTC timezone
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                return dt
-            except (ValueError, TypeError):
+                dt = dateutil_parser.parse(match.group(1), fuzzy=True)
+                return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError, OverflowError):
                 continue
-    
-    # Fallback: try fuzzy parsing on entire text (first 500 chars)
+
     try:
         dt = dateutil_parser.parse(text[:500], fuzzy=True)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except (ValueError, TypeError):
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError, OverflowError):
         pass
-    
-    # Final fallback
-    if fallback:
-        return fallback
-    return datetime.now(timezone.utc)
+
+    return fallback if fallback else datetime.now(timezone.utc)
+
+
+def extract_interval_from_text(
+    text: str, fallback: Optional[TemporalInterval] = None
+) -> Optional[TemporalInterval]:
+    """
+    Extract a half-open :class:`TemporalInterval` from text.
+
+    Recognises, in order of specificity: explicit quarters (``Q3 2023``), fiscal
+    years (``FY2021``), year ranges (``2017-2022``), and bare four-digit years.
+    Returns ``None`` if nothing temporal is found and no fallback is given, which
+    lets the caller decide between point mode and skipping the document.
+    """
+    match = _QUARTER_RE.search(text)
+    if match:
+        year_token = re.sub(r"\D", "", match.group(2))
+        if len(year_token) == 4:
+            return TemporalInterval.of_quarter(int(year_token), int(match.group(1)))
+
+    match = _FY_RE.search(text)
+    if match:
+        return TemporalInterval.of_year(int(match.group(1)))
+
+    match = _YEAR_RANGE_RE.search(text)
+    if match:
+        first, last = int(match.group(1)), int(match.group(2))
+        if first <= last:
+            return TemporalInterval.spanning(first, last)
+
+    match = _BARE_YEAR_RE.search(text)
+    if match:
+        return TemporalInterval.of_year(int(match.group(0)))
+
+    return fallback
 
 
 # ============================================================================
-# Document and Query Representations
+# Documents and queries
 # ============================================================================
+
 
 @dataclass
 class SpinDocument:
     """
-    A document with multi-scale temporal-phase spin encoding (point or arc mode).
-    
+    One indexed representation of a chunk.
+
+    A chunk whose interval crosses a period boundary produces several
+    ``SpinDocument`` rows — distinct ``doc_id`` values, identical ``group_id``,
+    identical semantic embedding, different temporal tuples. Deduplication on
+    ``group_id`` happens at the application layer so the consumer sees the chunk
+    once; see :func:`deduplicate_by_group`.
+
     Attributes:
-        doc_id: Unique identifier
-        text: Original document text
-        timestamp: Document timestamp (UTC) - start time for arcs
-        semantic_embedding: Semantic embedding vector from model
-        spin_vector: Always 9D [x_q, y_q, z_q, x_d, y_d, z_d, x_c, y_c, z_c]
-                    - z components are 0 for points (instant)
-                    - z components >0 for arcs (time period)
-        phi: Dict with phase angles for each scale {'quarter': φ_q, 'decade': φ_d, 'century': φ_c}
-        full_embedding: Concatenated [semantic_embedding + spin_vector]
-        end_timestamp: Optional end timestamp for arc mode (None for points)
-        phi_start: Dict with start angles for each scale (None values for points)
-        phi_end: Dict with end angles for each scale (None values for points)
-        is_arc: True if this is an arc (time period), False if point (instant)
+        doc_id: Unique per representation. Suffixed ``#k`` when split.
+        group_id: Shared across every representation of one source chunk.
+        text: Chunk text.
+        encoding: The temporal vector, tuples and header.
+        semantic_embedding: Output of the frozen embedding model.
+        full_embedding: ``semantic_embedding`` with the temporal vector appended.
+        metadata: Arbitrary caller metadata.
     """
+
     doc_id: str
     text: str
-    timestamp: datetime
     semantic_embedding: List[float]
-    spin_vector: List[float]
-    phi: Dict[str, float]
-    full_embedding: List[float]
-    metadata: Dict[str, Any] = None
-    end_timestamp: Optional[datetime] = None
-    phi_start: Optional[Dict[str, Optional[float]]] = None
-    phi_end: Optional[Dict[str, Optional[float]]] = None
-    is_arc: bool = False
-    
-    def __post_init__(self):
-        if self.metadata is None:
-            self.metadata = {}
-        # Auto-detect arc mode
-        if self.end_timestamp is not None:
-            self.is_arc = True
+    encoding: TemporalEncoding
+    full_embedding: List[float] = field(default_factory=list)
+    group_id: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.group_id:
+            self.group_id = self.encoding.group_id
+        if not self.full_embedding:
+            self.full_embedding = list(self.semantic_embedding) + self.encoding.to_vector()
+
+    # -- convenience -------------------------------------------------------
+
+    @property
+    def interval(self) -> TemporalInterval:
+        """The component interval this representation covers."""
+        return self.encoding.interval
+
+    @property
+    def source_interval(self) -> TemporalInterval:
+        """The full interval of the underlying chunk, before any splitting."""
+        return self.encoding.source_interval
+
+    @property
+    def timestamp(self) -> datetime:
+        return self.encoding.interval.start
+
+    @property
+    def end_timestamp(self) -> Optional[datetime]:
+        return self.encoding.interval.end
+
+    @property
+    def is_arc(self) -> bool:
+        return not self.encoding.is_point
+
+    @property
+    def is_split(self) -> bool:
+        return self.encoding.is_split
+
+    @property
+    def spin_vector(self) -> List[float]:
+        return self.encoding.to_vector()
+
+    @property
+    def phi(self) -> Dict[str, float]:
+        """Centre phase per scale, keyed by scale name."""
+        return {t.scale_name: t.phi_center for t in self.encoding.tuples}
+
+    @property
+    def z(self) -> Dict[str, float]:
+        """Arc length per scale, keyed by scale name."""
+        return {t.scale_name: t.z for t in self.encoding.tuples}
 
 
 @dataclass
 class SpinQuery:
     """
-    A query with multi-scale temporal-phase spin encoding (point or arc mode).
-    
-    Attributes:
-        query_text: Query string
-        query_timestamp: Target timestamp for retrieval (start for arcs)
-        semantic_embedding: Semantic query embedding
-        spin_vector: Always 9D [x_q, y_q, z_q, x_d, y_d, z_d, x_c, y_c, z_c]
-        phi: Dict with phase angles for each scale {'quarter': φ_q, 'decade': φ_d, 'century': φ_c}
-        lambda_factor: Weight for spin component (default: 1.0)
-        full_embedding: Concatenated query vector
-        end_timestamp: Optional end timestamp for arc queries
-        phi_start: Dict with start angles for each scale (None values for points)
-        phi_end: Dict with end angles for each scale (None values for points)
-        is_arc: True if querying a time period
+    An encoded query: semantic embedding plus a query temporal vector.
+
+    Queries are never split into multiple representations — a query arc is compared
+    against stored arcs directly. ``lambda_factor`` scales the temporal block during
+    the coarse first pass so that semantic similarity stays dominant while candidates
+    are gathered.
     """
+
     query_text: str
-    query_timestamp: datetime
     semantic_embedding: List[float]
-    spin_vector: List[float]
-    phi: Dict[str, float]
-    lambda_factor: float = 1.0
-    full_embedding: List[float] = None
-    end_timestamp: Optional[datetime] = None
-    phi_start: Optional[Dict[str, Optional[float]]] = None
-    phi_end: Optional[Dict[str, Optional[float]]] = None
-    is_arc: bool = False
-    
-    def __post_init__(self):
-        if self.full_embedding is None:
-            # Weighted concatenation: [semantic + λ * spin]
-            weighted_spin = [self.lambda_factor * x for x in self.spin_vector]
-            self.full_embedding = self.semantic_embedding + weighted_spin
+    encoding: TemporalEncoding
+    lambda_factor: float = 0.1
+    full_embedding: List[float] = field(default_factory=list)
+    plan: Optional[TraversalPlan] = None
+
+    def __post_init__(self) -> None:
+        if not self.full_embedding:
+            weighted = [self.lambda_factor * x for x in self.encoding.to_vector()]
+            self.full_embedding = list(self.semantic_embedding) + weighted
+        if self.plan is None:
+            self.plan = traversal_plan(self.encoding)
+
+    @property
+    def interval(self) -> TemporalInterval:
+        return self.encoding.interval
+
+    @property
+    def is_arc(self) -> bool:
+        return not self.encoding.is_point
+
+    @property
+    def query_timestamp(self) -> datetime:
+        return self.encoding.interval.start
+
+    @property
+    def end_timestamp(self) -> Optional[datetime]:
+        return self.encoding.interval.end
+
+    @property
+    def phi(self) -> Dict[str, float]:
+        return {t.scale_name: t.phi_center for t in self.encoding.tuples}
 
 
 @dataclass
 class RetrievalResult:
     """
-    A single retrieval result with scores and metadata.
+    A scored, ranked hit.
+
+    Attributes:
+        semantic_score: Cosine similarity of the semantic blocks alone.
+        temporal_alignment: Weighted per-scale alignment over the traversed scales.
+        combined_score: ``(1 - beta) * semantic + beta * temporal``, before any
+            metadata priority multiplier.
+        scale_matches: Per-scale detail for the scales that were actually traversed.
+        traversed_scales: Which circles the lazy plan descended into.
+        rejected_at: Scale name that caused a hard rejection, if any.
     """
+
     doc_id: str
+    group_id: str
     text: str
-    timestamp: datetime
+    interval: TemporalInterval
     semantic_score: float
-    phi_doc: float
-    phi_query: float
-    phi_difference: float
-    temporal_alignment: float  # exp(-β × (Δφ)²)
+    temporal_alignment: float
     combined_score: float
+    scale_matches: Dict[str, ScaleMatch] = field(default_factory=dict)
+    traversed_scales: Tuple[str, ...] = ()
+    rejected_at: Optional[str] = None
     rank: int = 0
-    metadata: Dict[str, Any] = None
-    
-    def __post_init__(self):
-        if self.metadata is None:
-            self.metadata = {}
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    # -- convenience -------------------------------------------------------
+
+    @property
+    def timestamp(self) -> datetime:
+        return self.interval.start
+
+    @property
+    def phi_difference(self) -> float:
+        """Angular distance on the primary discriminating scale, for display."""
+        for name in ("decade", *self.traversed_scales):
+            if name in self.scale_matches:
+                return self.scale_matches[name].delta_phi
+        return 0.0
+
+    def explain(self) -> str:
+        lines = [
+            f"Rank #{self.rank}  {self.doc_id}",
+            f"  interval  : {self.interval}",
+            f"  semantic  : {self.semantic_score:.4f}",
+            f"  temporal  : {self.temporal_alignment:.4f}",
+            f"  combined  : {self.combined_score:.4f}",
+            f"  traversed : {', '.join(self.traversed_scales) or '(none)'}",
+        ]
+        for name in self.traversed_scales:
+            m = self.scale_matches.get(name)
+            if m is None:
+                continue
+            segs = ",".join(str(s) for s in m.shared_segments) or "-"
+            lines.append(
+                f"    {name:<10} overlap={'yes' if m.overlaps else 'no ':<3} "
+                f"jaccard={m.jaccard:.4f} dphi={math.degrees(m.delta_phi):6.2f}deg "
+                f"segments[{segs}]"
+            )
+        if self.rejected_at:
+            lines.append(f"  REJECTED at {self.rejected_at}")
+        preview = self.text.replace("\n", " ")[:160]
+        lines.append(f"  text      : {preview}")
+        return "\n".join(lines)
 
 
 # ============================================================================
-# Embedding Utilities
+# Deduplication
 # ============================================================================
+
+
+def deduplicate_by_group(results: List[RetrievalResult]) -> List[RetrievalResult]:
+    """
+    Collapse multiple representations of one chunk down to its best-scoring hit.
+
+    A chunk split across period boundaries is indexed several times, and a query arc
+    straddling a divider can match more than one of those representations through
+    different component indexing paths. Deduplicating on ``group_id`` at the
+    application layer — rather than trying to prevent the multiple matches
+    geometrically — is what lets the index stay in a single unified coordinate space
+    while the consumer still receives each chunk exactly once.
+
+    Input order is not required to be sorted; the highest ``combined_score`` wins and
+    the surviving order follows the input.
+    """
+    best: Dict[str, RetrievalResult] = {}
+    order: List[str] = []
+    for result in results:
+        key = result.group_id or result.doc_id
+        if key not in best:
+            best[key] = result
+            order.append(key)
+        elif result.combined_score > best[key].combined_score:
+            best[key] = result
+    return [best[k] for k in order]
+
+
+# ============================================================================
+# Vector utilities
+# ============================================================================
+
 
 def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
-    """
-    Compute cosine similarity between two vectors.
-    
-    Returns value in [-1, 1], where 1 = identical direction.
-    """
+    """Cosine similarity in ``[-1, 1]``. Returns 0.0 if either vector is empty."""
+    if not vec1 or not vec2:
+        return 0.0
     if len(vec1) != len(vec2):
-        raise ValueError("Vectors must have same dimension")
-    
-    dot_product = sum(a * b for a, b in zip(vec1, vec2))
+        raise ValueError(
+            f"vectors must have same dimension, got {len(vec1)} and {len(vec2)}"
+        )
+    dot = sum(a * b for a, b in zip(vec1, vec2))
     norm1 = math.sqrt(sum(a * a for a in vec1))
     norm2 = math.sqrt(sum(b * b for b in vec2))
-    
     if norm1 == 0 or norm2 == 0:
         return 0.0
-    
-    return dot_product / (norm1 * norm2)
+    return dot / (norm1 * norm2)
 
 
 def normalize_vector(vec: List[float]) -> List[float]:
-    """L2-normalize a vector to unit length."""
+    """L2-normalise to unit length. A zero vector is returned unchanged."""
     norm = math.sqrt(sum(x * x for x in vec))
-    if norm == 0:
-        return vec
-    return [x / norm for x in vec]
+    return vec if norm == 0 else [x / norm for x in vec]
 
+
+# ============================================================================
+# Backwards compatibility (schema version 1)
+# ============================================================================
+
+#: Legacy epoch constant. Schema v1 encoded against 2010-01-01; new corpora use
+#: :data:`temporal_config.EPOCH_1900`. Kept so v1 code paths keep importing.
+T0_EPOCH = EPOCH_2010_LEGACY
+T0_SECONDS = EPOCH_2010_LEGACY.timestamp()
+
+QUARTER_SCALE_YEARS = QUARTER_SCALE.period_years
+DECADE_SCALE_YEARS = DECADE_SCALE.period_years
+CENTURY_SCALE_YEARS = CENTURY_SCALE.period_years
+
+QUARTER_WEIGHT = QUARTER_SCALE.weight
+DECADE_WEIGHT = DECADE_SCALE.weight
+CENTURY_WEIGHT = CENTURY_SCALE.weight
+
+
+def compute_spin_vector(
+    timestamp_seconds: float,
+    t0_seconds: float = None,
+    period_seconds: float = None,
+    phase_offset: float = 0.0,
+    temporal_scale: float = 1.0,
+    end_timestamp_seconds: Optional[float] = None,
+    hierarchy: TemporalHierarchy = DEFAULT_HIERARCHY,
+) -> Tuple[List[float], Dict[str, float], Dict[str, Optional[float]], Dict[str, Optional[float]]]:
+    """
+    Schema-v1 compatibility shim.
+
+    Returns the same ``(spin_vector, phi_centers, phi_starts, phi_ends)`` tuple the
+    previous release did, computed through the current encoder. New code should call
+    :func:`temporal_encoding.encode` and work with :class:`TemporalEncoding`, which
+    carries the header, segments and group identity this signature cannot express.
+
+    ``period_seconds`` and ``phase_offset`` are ignored; ``t0_seconds`` overrides the
+    hierarchy epoch when supplied.
+    """
+    if t0_seconds is not None:
+        hierarchy = TemporalHierarchy(
+            epoch=datetime.fromtimestamp(t0_seconds, tz=timezone.utc),
+            scales=hierarchy.scales,
+            year_convention=hierarchy.year_convention,
+        )
+
+    start = datetime.fromtimestamp(timestamp_seconds, tz=timezone.utc)
+    end = (
+        datetime.fromtimestamp(end_timestamp_seconds, tz=timezone.utc)
+        if end_timestamp_seconds is not None
+        else None
+    )
+    encoding = encode_single(TemporalInterval(start, end), hierarchy)
+
+    vector: List[float] = []
+    centers: Dict[str, float] = {}
+    starts: Dict[str, Optional[float]] = {}
+    ends: Dict[str, Optional[float]] = {}
+    for t in encoding.tuples:
+        vector.extend([temporal_scale * t.cos, temporal_scale * t.sin, t.z])
+        centers[t.scale_name] = t.phi_center
+        starts[t.scale_name] = None if t.is_point else t.phi_start
+        ends[t.scale_name] = None if t.is_point else t.phi_end
+    return vector, centers, starts, ends

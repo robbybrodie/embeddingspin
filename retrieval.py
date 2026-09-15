@@ -1,574 +1,438 @@
 """
-Multi-Pass Temporal-Phase Spin Retrieval
-=========================================
+Two-Pass Temporal-Phase Spin Retrieval
+======================================
 
-Implements the two-pass retrieval algorithm:
+Pass 1 — coarse semantic recall
+    Score every stored vector as ``0.9 * semantic + 0.1 * temporal`` and keep the
+    top ``top_k_coarse`` (200 by default). The small temporal weight keeps semantic
+    meaning as the primary criterion and stops chronological constraints from
+    excluding relevant documents before they have been considered on merit.
 
-Pass 1 - Coarse Recall:
-    Use small λ for broad semantic search across all time periods.
-    Retrieves top-K candidates using cosine similarity on full embeddings.
+Pass 2 — temporal re-ranking
+    For each candidate, descend the hierarchy under a :class:`TraversalPlan`, which
+    visits only the circles the query actually needs. At each visited circle:
 
-Pass 2 - Temporal Zoom Re-ranking:
-    Recompute scores for top-K results using temporal alignment:
-        score = semantic_similarity × exp(-β × (Δφ)²)
-    
-    where:
-    - Δφ = smallest angular difference between query and document phases
-    - β = zoom factor (0 = no temporal focus, 10+ = sharp temporal focus)
+    - **Hard gate.** No arc overlap at any traversed scale rejects the document
+      outright. This is what stops a Q2 2024 report from answering a Q2 2023
+      question: the two coincide exactly on the 1-year circle and separate only on
+      the 16-year circle.
+    - **Soft score.** A Jaccard overlap coefficient per scale, combined using the
+      hierarchy's weights.
 
-The β parameter acts as a "temporal zoom knob" - adjusting it lets you
-smoothly transition from broad semantic search to temporally-focused retrieval.
+    The final score blends the two axes under the temporal-focus parameter β::
+
+        score = (1 - beta) * semantic_similarity + beta * temporal_alignment
+
+    β = 0 is pure semantic search; β = 1 is absolute temporal dominance; the default
+    0.5 balances them.
+
+Pass 3 — priority and deduplication
+    Optional metadata-driven priority multipliers, then deduplication on
+    ``group_id`` so a chunk split across period boundaries is returned once.
 """
 
-import math
+from __future__ import annotations
+
 import logging
-from typing import List, Optional, Tuple
+import math
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from temporal_config import DEFAULT_HIERARCHY, TemporalHierarchy
+from temporal_encoding import (
+    ScaleMatch,
+    TemporalInterval,
+    TraversalPlan,
+    encode_single,
+    evaluate_scale,
+    full_span_interval,
+    traversal_plan,
+)
+from temporal_spin import (
+    RetrievalResult,
+    SpinDocument,
+    SpinQuery,
+    cosine_similarity,
+    deduplicate_by_group,
+)
+from vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
 
-from temporal_spin import (
-    SpinQuery,
-    SpinDocument,
-    RetrievalResult,
-    compute_spin_vector,
-    angular_difference,
-    arc_overlap,
-    jaccard_similarity_arcs,
-    cosine_similarity,
-    T0_SECONDS,
-    QUARTER_PERIOD_SECONDS,
-    DECADE_PERIOD_SECONDS,
-    CENTURY_PERIOD_SECONDS,
-    QUARTER_WEIGHT,
-    DECADE_WEIGHT,
-    CENTURY_WEIGHT
-)
-from llamastack_client import LlamaStackEmbeddingClient
-from vector_store import VectorStore
+
+# Pass-1 blend. Semantic meaning dominates so that the candidate pool is broad.
+COARSE_SEMANTIC_WEIGHT = 0.9
+COARSE_TEMPORAL_WEIGHT = 0.1
+
+# Multipliers applied after scoring, keyed on the ``chunk_type`` metadata field.
+# Structured facts outrank narrative prose when both are temporally valid.
+DEFAULT_PRIORITY_MULTIPLIERS: Dict[str, float] = {
+    "fact": 3.0,
+    "footnote": 2.0,
+    "financial_table": 1.5,
+    "narrative": 1.0,
+    "legacy": 1.0,
+}
 
 
 class TemporalSpinRetriever:
     """
-    Multi-pass temporal-phase spin retrieval system.
-    
-    This retriever implements a two-stage approach:
-    
-    Stage 1: Coarse semantic recall using small λ to get candidates
-    Stage 2: Temporal zoom re-ranking using β to focus on query time
-    
-    Key Innovation:
-    ---------------
-    No model retraining required. Time is encoded as a continuous angular
-    coordinate on the unit circle, allowing smooth interpolation and
-    explicit control over temporal alignment via the β parameter.
-    
-    β Parameter (Temporal Zoom Knob):
-    ---------------------------------
-    With 100-year period, phase spacing is ~3.6° per year:
-    - β = 0.0: Pure semantic search (time ignored)
-    - β = 0.3: Light temporal preference
-    - β = 0.5: Balanced temporal-semantic weighting [DEFAULT]
-    - β = 0.7: Strong temporal focus
-    - β = 1.0: Temporal alignment dominates
-    
-    Combined score = (1-β) × semantic_similarity + β × temporal_alignment
-    
-    With β = 0.5 (50/50 balance):
-    - Same quarter/year gets full temporal boost
-    - Adjacent quarters still score well
-    - Distant years (10+ years apart) are distinguished
-    - Semantic similarity remains important
-    
-    Note: Lower β values (0.3-0.7) work well with 100-year period because
-    tighter phase spacing provides stronger temporal signal.
+    Two-pass retriever over a corpus of temporally-encoded semantic vectors.
+
+    The retriever's hierarchy must match the one used at ingestion. Mismatched
+    epochs or periods produce phases that are not comparable, so the constructor
+    refuses hierarchies that are not compatible extensions of one another when the
+    store reports its own.
+
+    Args:
+        embedding_client: Provides query embeddings. Must be the same model used at
+            ingestion.
+        vector_store: Backend holding the indexed documents.
+        hierarchy: Scales and epoch. Defaults to 1/16/256 from 1900-01-01.
+        default_beta: Temporal-focus parameter in ``[0, 1]``.
+        lambda_coarse: Weight applied to the temporal block during pass 1.
+        priority_multipliers: Optional overrides for the ``chunk_type`` boosts.
     """
-    
+
     def __init__(
         self,
-        embedding_client: LlamaStackEmbeddingClient,
+        embedding_client,
         vector_store: VectorStore,
-        t0_seconds: float = T0_SECONDS,
-        period_seconds: float = None,  # Deprecated - multi-scale now
-        default_lambda: float = 1.0,
+        hierarchy: TemporalHierarchy = DEFAULT_HIERARCHY,
         default_beta: float = 0.5,
-        temporal_scale: float = 1.0
-    ):
-        """
-        Initialize retriever.
-        
-        Args:
-            embedding_client: Client for query embeddings
-            vector_store: Vector database with documents
-            t0_seconds: Base epoch for spin encoding
-            period_seconds: Deprecated (kept for backward compatibility, ignored)
-            default_lambda: Default weight for spin in Pass 1 (coarse recall)
-            default_beta: Default zoom factor for Pass 2 (re-ranking)
-            temporal_scale: Scaling factor for spin vectors (default: 1.0)
-                           Note: Has no effect on cosine similarity (scale-invariant).
-                           Must match the temporal_scale used during ingestion
-        """
+        lambda_coarse: float = 0.1,
+        priority_multipliers: Optional[Dict[str, float]] = None,
+    ) -> None:
+        if not 0.0 <= default_beta <= 1.0:
+            raise ValueError(f"default_beta must be in [0, 1], got {default_beta}")
         self.embedding_client = embedding_client
         self.vector_store = vector_store
-        self.t0_seconds = t0_seconds
-        # period_seconds is deprecated - multi-scale encoding now used
-        self.default_lambda = default_lambda
+        self.hierarchy = hierarchy
         self.default_beta = default_beta
-        self.temporal_scale = temporal_scale
-    
+        self.lambda_coarse = lambda_coarse
+        self.priority_multipliers = (
+            DEFAULT_PRIORITY_MULTIPLIERS
+            if priority_multipliers is None
+            else priority_multipliers
+        )
+
+        store_hierarchy = getattr(vector_store, "hierarchy", None)
+        if store_hierarchy is not None and not hierarchy.is_compatible_with(store_hierarchy):
+            raise ValueError(
+                "retriever hierarchy is incompatible with the vector store's:\n"
+                f"  retriever: {hierarchy.fingerprint()}\n"
+                f"  store    : {store_hierarchy.fingerprint()}\n"
+                "Re-index the corpus or construct the retriever with the store's hierarchy."
+            )
+
+    # ------------------------------------------------------------------
+    # Query construction
+    # ------------------------------------------------------------------
+
     def create_query(
         self,
         query_text: str,
-        query_timestamp: Optional[datetime] = None,
-        lambda_factor: Optional[datetime] = None,
-        end_timestamp: Optional[datetime] = None
+        interval: Optional[TemporalInterval] = None,
+        lambda_factor: Optional[float] = None,
     ) -> SpinQuery:
         """
-        Create a SpinQuery with temporal encoding (point or arc mode).
-        
-        Args:
-            query_text: Query string
-            query_timestamp: Target timestamp (default: now, start for arcs)
-            lambda_factor: Weight for spin component (default: self.default_lambda)
-            end_timestamp: Optional end timestamp for arc queries
-        
-        Returns:
-            SpinQuery with embeddings and spin encoding (point or arc)
+        Embed a query and encode its temporal constraint.
+
+        A query with no temporal constraint is encoded as a full-span arc, which
+        saturates every circle and therefore reduces to pure semantic search — the
+        lazy traversal plan will find nothing worth checking and fall back to the
+        outermost scale alone.
+
+        Note what it is *not* encoded as: an instant at "now". That would be a point
+        query against the present moment, which rejects the entire corpus. "I did not
+        say when" and "I mean right now" are different questions.
         """
-        print(f"🔍 CREATE_QUERY: query_ts={query_timestamp}, end_ts={end_timestamp}")
-        
-        if query_timestamp is None:
-            query_timestamp = datetime.now(timezone.utc)
-            print(f"🔍 CREATE_QUERY: Fell back to NOW: {query_timestamp}")
-        
-        if query_timestamp.tzinfo is None:
-            query_timestamp = query_timestamp.replace(tzinfo=timezone.utc)
-        
-        if lambda_factor is None:
-            lambda_factor = self.default_lambda
-        
-        # Get semantic embedding
+        if interval is None:
+            interval = full_span_interval(self.hierarchy)
+
         semantic_embedding = self.embedding_client.embed_single(query_text)
-        
-        # Compute spin vector (point or arc mode, must match ingestion)
-        query_seconds = query_timestamp.timestamp()
-        end_seconds = end_timestamp.timestamp() if end_timestamp else None
-        
-        spin_vector, phi_centers, phi_starts, phi_ends = compute_spin_vector(
-            query_seconds,
-            self.t0_seconds,
-            period_seconds=None,  # Deprecated - multi-scale encoding used
-            temporal_scale=self.temporal_scale,
-            end_timestamp_seconds=end_seconds
+        encoding = encode_single(interval, self.hierarchy)
+        plan = traversal_plan(encoding, self.hierarchy)
+
+        logger.debug(
+            "query %r interval=%s traverse=%s skipped=%s",
+            query_text[:60],
+            interval,
+            plan.scale_names,
+            [s[0] for s in plan.skipped],
         )
-        
-        # Create query object (handles concatenation internally)
-        query = SpinQuery(
+
+        return SpinQuery(
             query_text=query_text,
-            query_timestamp=query_timestamp,
             semantic_embedding=semantic_embedding,
-            spin_vector=spin_vector,
-            phi=phi_centers,  # Now a dict with keys 'quarter', 'decade', 'century'
-            lambda_factor=lambda_factor,
-            end_timestamp=end_timestamp,
-            phi_start=phi_starts,  # Now a dict
-            phi_end=phi_ends,  # Now a dict
-            is_arc=(end_timestamp is not None)
+            encoding=encoding,
+            lambda_factor=self.lambda_coarse if lambda_factor is None else lambda_factor,
+            plan=plan,
         )
-        
-        return query
-    
+
+    # ------------------------------------------------------------------
+    # Scoring
+    # ------------------------------------------------------------------
+
+    def score_candidate(
+        self,
+        query: SpinQuery,
+        doc: SpinDocument,
+        beta: float,
+        plan: TraversalPlan,
+    ) -> Optional[RetrievalResult]:
+        """
+        Apply the hard gate and compute the blended score for one candidate.
+
+        Returns ``None`` when the document fails the overlap gate at any traversed
+        scale. Scales are visited coarsest-first so the widest, cheapest rejection
+        happens before any fine-grained work.
+        """
+        semantic_score = cosine_similarity(
+            query.semantic_embedding, doc.semantic_embedding
+        )
+
+        matches: Dict[str, ScaleMatch] = {}
+        for scale_name in plan:
+            scale = self.hierarchy.scale(scale_name)
+            try:
+                q_tuple = query.encoding.tuple_for(scale_name)
+                d_tuple = doc.encoding.tuple_for(scale_name)
+            except KeyError:
+                # The document predates this scale and was padded, or the query
+                # never encoded it. Either way there is nothing to check here.
+                continue
+
+            match = evaluate_scale(q_tuple, d_tuple, scale)
+            matches[scale_name] = match
+            if not match.overlaps:
+                logger.debug(
+                    "reject %s at %s: query arc [%.4f,+%.4f] vs doc [%.4f,+%.4f]",
+                    doc.doc_id,
+                    scale_name,
+                    q_tuple.phi_start,
+                    q_tuple.z,
+                    d_tuple.phi_start,
+                    d_tuple.z,
+                )
+                return None
+
+        if not matches:
+            # Nothing was traversable: fall back to pure semantic scoring.
+            return RetrievalResult(
+                doc_id=doc.doc_id,
+                group_id=doc.group_id,
+                text=doc.text,
+                interval=doc.interval,
+                semantic_score=semantic_score,
+                temporal_alignment=1.0,
+                combined_score=semantic_score,
+                traversed_scales=tuple(plan.scale_names),
+                metadata=doc.metadata,
+            )
+
+        weights = self.hierarchy.normalized_weights(list(matches))
+        temporal = sum(weights[name] * m.jaccard for name, m in matches.items())
+
+        # Blend the two axes. beta shifts prioritisation from pure semantic search
+        # at 0 to absolute temporal dominance at 1.
+        combined = (1.0 - beta) * semantic_score + beta * temporal
+
+        return RetrievalResult(
+            doc_id=doc.doc_id,
+            group_id=doc.group_id,
+            text=doc.text,
+            interval=doc.interval,
+            semantic_score=semantic_score,
+            temporal_alignment=temporal,
+            combined_score=combined,
+            scale_matches=matches,
+            traversed_scales=tuple(plan.scale_names),
+            metadata=doc.metadata,
+        )
+
+    def _apply_priority(self, result: RetrievalResult) -> None:
+        chunk_type = (result.metadata or {}).get("chunk_type", "legacy")
+        result.combined_score *= self.priority_multipliers.get(chunk_type, 1.0)
+
+    # ------------------------------------------------------------------
+    # Search
+    # ------------------------------------------------------------------
+
     def search(
         self,
         query_text: str,
-        query_timestamp: Optional[datetime] = None,
-        query_start_timestamp: Optional[datetime] = None,
-        query_end_timestamp: Optional[datetime] = None,
+        interval: Optional[TemporalInterval] = None,
         beta: Optional[float] = None,
-        lambda_coarse: float = 0.1,
-        top_k_coarse: int = 50,
+        top_k_coarse: int = 200,
         top_k_final: int = 10,
-        end_timestamp: Optional[datetime] = None,  # Deprecated - use query_end_timestamp
-        concept_filter: Optional[List[str]] = None  # NEW: Filter by XBRL concepts
+        concept_filter: Optional[List[str]] = None,
+        deduplicate: bool = True,
     ) -> List[RetrievalResult]:
         """
-        Execute two-pass temporal-phase spin retrieval.
-        
-        Pass 1 (Coarse Recall):
-        -----------------------
-        Use small λ (e.g., 0.1) to perform broad semantic search.
-        This retrieves top_k_coarse candidates that are semantically relevant,
-        with only minor temporal weighting.
-        
-        NEW: If concept_filter is provided, constrains retrieval to only documents
-        matching those XBRL concepts (e.g., ['NetIncomeLoss', 'Revenues']).
-        
-        Pass 2 (Temporal Zoom Re-ranking):
-        ----------------------------------
-        Recompute scores for Pass 1 results using:
-            score = semantic_sim × exp(-β × (Δφ)²)
-        
-        This applies temporal alignment based on phase difference,
-        controlled by β (zoom factor).
-        
+        Execute the two-pass search.
+
         Args:
-            query_text: Query string
-            query_timestamp: Target timestamp for retrieval (start for arcs)
-            query_start_timestamp: Arc start timestamp (preferred over query_timestamp)
-            query_end_timestamp: Arc end timestamp
-            beta: Zoom factor for temporal focus (default: self.default_beta)
-            lambda_coarse: Spin weight for coarse recall (default: 0.1)
-            top_k_coarse: Number of candidates from Pass 1 (default: 50)
-            top_k_final: Number of final results to return (default: 10)
-            end_timestamp: Optional end timestamp for arc queries (deprecated)
-            concept_filter: Optional list of XBRL concepts to filter by
-        
+            query_text: Natural-language query.
+            interval: Temporal constraint. ``None`` means no constraint.
+            beta: Temporal focus in ``[0, 1]``. Defaults to the retriever's.
+            top_k_coarse: Candidate pool size from pass 1.
+            top_k_final: Results returned after re-ranking.
+            concept_filter: Optional XBRL concept names to restrict fact chunks to.
+            deduplicate: Collapse split representations on ``group_id``.
+
         Returns:
-            List of RetrievalResult objects, sorted by combined score
+            Results sorted by descending combined score, ranked from 1.
         """
-        print(f"🔍 SEARCH CALLED: query_start={query_start_timestamp}, query_end={query_end_timestamp}, query_ts={query_timestamp}")
-        
-        if beta is None:
-            beta = self.default_beta
-        
-        # Determine if this is an arc or point query
-        # Prefer explicit arc parameters over legacy end_timestamp
-        if query_start_timestamp and query_end_timestamp:
-            # Arc query (new style)
-            query_ts = query_start_timestamp
-            end_ts = query_end_timestamp
-            print(f"🔍 RETRIEVER: ARC QUERY (new): {query_ts} to {end_ts}")
-            logger.info(f"🔍 ARC QUERY: {query_ts} to {end_ts}")
-        elif query_timestamp and end_timestamp:
-            # Arc query (legacy style)
-            query_ts = query_timestamp
-            end_ts = end_timestamp
-            print(f"🔍 RETRIEVER: ARC QUERY (legacy): {query_ts} to {end_ts}")
-            logger.info(f"🔍 ARC QUERY (legacy): {query_ts} to {end_ts}")
-        else:
-            # Point query
-            query_ts = query_timestamp
-            end_ts = None
-            print(f"🔍 RETRIEVER: POINT QUERY: {query_ts}")
-            logger.info(f"🔍 POINT QUERY: {query_ts}")
-        
-        # ====================================================================
-        # PASS 1: COARSE RECALL (broad semantic search)
-        # ====================================================================
-        
-        # Create query with small λ for broad search
-        query = self.create_query(
-            query_text=query_text,
-            query_timestamp=query_ts,
-            lambda_factor=lambda_coarse,
-            end_timestamp=end_ts
-        )
-        
-        # Build metadata filter if concept_filter is provided
-        filter_dict = None
-        if concept_filter:
-            # Filter for facts matching any of the target concepts
-            # Check both 'concept' (local name) and 'concept_full' (namespace-prefixed)
-            filter_dict = {
-                "$and": [
-                    {"chunk_type": "fact"},  # Only filter facts
-                    {
-                        "$or": [
-                            {"concept": {"$in": concept_filter}},
-                            {"concept_full": {"$in": concept_filter}}
-                        ]
-                    }
-                ]
-            }
-            logger.info(f"🔍 CONCEPT FILTER: Constraining retrieval to {len(concept_filter)} concepts")
-            print(f"🔍 CONCEPT FILTER: {concept_filter[:5]}{'...' if len(concept_filter) > 5 else ''}")
-        
-        # Retrieve top-K candidates from vector store
+        beta = self.default_beta if beta is None else beta
+        if not 0.0 <= beta <= 1.0:
+            raise ValueError(f"beta must be in [0, 1], got {beta}")
+
+        query = self.create_query(query_text, interval)
+        plan = query.plan or traversal_plan(query.encoding, self.hierarchy)
+
+        # -- Pass 1: coarse semantic recall -----------------------------
+        filter_dict = _concept_filter_clause(concept_filter)
         candidates = self.vector_store.search(
             query_embedding=query.full_embedding,
             top_k=top_k_coarse,
-            filter_dict=filter_dict  # NEW: Pass metadata filter
+            filter_dict=filter_dict,
         )
-        
         if not candidates:
             return []
-        
-        # ====================================================================
-        # PASS 2: TEMPORAL ZOOM RE-RANKING (Arc-aware)
-        # ====================================================================
-        
-        results = []
-        for doc, coarse_score in candidates:
-            # Compute semantic similarity (without spin component)
-            semantic_score = cosine_similarity(
-                query.semantic_embedding,
-                doc.semantic_embedding
-            )
-            
-            # ========================================================
-            # MULTI-SCALE TEMPORAL ALIGNMENT
-            # ========================================================
-            # Compute alignment at each scale (quarter, decade, century)
-            # and combine with weights
-            scale_alignments = []
-            scale_weights = [QUARTER_WEIGHT, DECADE_WEIGHT, CENTURY_WEIGHT]
-            delta_phi_avg = 0.0
-            
-            # NEW: Hard boundary check for arc-to-arc queries
-            # If arcs don't overlap at ANY scale, reject the document entirely
-            # This ensures proper year-to-year separation (decade scale) AND
-            # within-year position matching (quarter scale)
-            if query.is_arc and doc.is_arc:
-                # Check overlap at ALL scales (quarter, decade, century)
-                # If ANY scale has zero overlap, reject the document
-                reject_doc = False
-                
-                for scale_name in ['quarter', 'decade', 'century']:
-                    scale_overlap = arc_overlap(
-                        query.phi_start[scale_name], query.phi_end[scale_name],
-                        doc.phi_start[scale_name], doc.phi_end[scale_name]
-                    )
-                    
-                    if scale_overlap == 0.0:
-                        # HARD REJECT: Document arc doesn't intersect query arc at this scale
-                        # This prevents cross-year bleeding (decade) and ensures temporal accuracy
-                        logger.debug(
-                            f"Rejecting doc (arc boundary at {scale_name} scale): "
-                            f"query [{query.phi_start[scale_name]:.3f}, {query.phi_end[scale_name]:.3f}] "
-                            f"vs doc [{doc.phi_start[scale_name]:.3f}, {doc.phi_end[scale_name]:.3f}] "
-                            f"have zero overlap"
-                        )
-                        reject_doc = True
-                        break  # No need to check other scales
-                
-                if reject_doc:
-                    continue  # Skip to next candidate
-            
-            for scale_name in ['quarter', 'decade', 'century']:
-                query_phi = query.phi[scale_name]
-                doc_phi = doc.phi[scale_name]
-                
-                # Compute alignment at this scale based on point/arc types
-                if query.is_arc and doc.is_arc:
-                    # Arc-to-arc: Use Jaccard similarity
-                    scale_alignment = jaccard_similarity_arcs(
-                        query.phi_start[scale_name], query.phi_end[scale_name],
-                        doc.phi_start[scale_name], doc.phi_end[scale_name]
-                    )
-                elif query.is_arc and not doc.is_arc:
-                    # Arc-to-point: Check if point falls within query arc
-                    overlap = arc_overlap(
-                        query.phi_start[scale_name], query.phi_end[scale_name],
-                        doc_phi, doc_phi
-                    )
-                    if overlap > 0:
-                        scale_alignment = 1.0  # Point is within arc
-                    else:
-                        # Point outside arc: use distance to arc center
-                        delta = angular_difference(query_phi, doc_phi)
-                        scale_alignment = math.exp(-beta * (delta ** 2))
-                elif not query.is_arc and doc.is_arc:
-                    # Point-to-arc: Check if query point falls within doc arc
-                    overlap = arc_overlap(
-                        doc.phi_start[scale_name], doc.phi_end[scale_name],
-                        query_phi, query_phi
-                    )
-                    if overlap > 0:
-                        scale_alignment = 1.0  # Query point is within arc
-                    else:
-                        # Query point outside arc: use distance to arc center
-                        delta = angular_difference(query_phi, doc_phi)
-                        scale_alignment = math.exp(-beta * (delta ** 2))
-                else:
-                    # Point-to-point: Use standard angular difference
-                    delta = angular_difference(query_phi, doc_phi)
-                    scale_alignment = math.exp(-beta * (delta ** 2))
-                    delta_phi_avg += delta
-                
-                scale_alignments.append(scale_alignment)
-            
-            # Weighted combination of scale alignments
-            # Decade scale gets highest weight (0.5) for year-to-year discrimination
-            temporal_alignment = sum(
-                w * a for w, a in zip(scale_weights, scale_alignments)
-            ) / sum(scale_weights)
-            
-            # Average delta_phi for reporting (using decade scale as primary)
-            delta_phi = angular_difference(
-                query.phi['decade'], doc.phi['decade']
-            )
-            
-            # Combined score: semantic similarity weighted by temporal alignment
-            combined_score = semantic_score * temporal_alignment
-            
-            # Create result object
-            # For reporting, use decade-scale phi (highest weight for year discrimination)
-            result = RetrievalResult(
-                doc_id=doc.doc_id,
-                text=doc.text,
-                timestamp=doc.timestamp,
-                semantic_score=semantic_score,
-                phi_doc=doc.phi['decade'],  # Use decade scale for reporting
-                phi_query=query.phi['decade'],  # Use decade scale for reporting
-                phi_difference=delta_phi,  # Already using decade scale
-                temporal_alignment=temporal_alignment,  # Multi-scale weighted
-                combined_score=combined_score,
-                metadata=doc.metadata
-            )
-            results.append(result)
-        
-        # ====================================================================
-        # PASS 3: PRIORITY BOOST (based on chunk_type metadata)
-        # ====================================================================
-        # Apply multipliers to prioritize structured data over narrative
-        PRIORITY_MULTIPLIERS = {
-            'fact': 3.0,          # 3.0x - Structured XBRL facts (highest priority)
-            'footnote': 2.0,      # 2.0x - Footnote disclosures
-            'financial_table': 1.5,  # 1.5x - Financial statement tables
-            'narrative': 1.0,     # 1.0x - General narrative (baseline)
-            'legacy': 1.0         # 1.0x - Documents without chunk_type (baseline)
-        }
-        
+
+        # -- Pass 2: temporal re-ranking --------------------------------
+        results: List[RetrievalResult] = []
+        for doc, _coarse_score in candidates:
+            result = self.score_candidate(query, doc, beta, plan)
+            if result is not None:
+                results.append(result)
+
+        # -- Pass 3: priority, dedup, rank ------------------------------
         for result in results:
-            # Get chunk_type from document metadata
-            chunk_type = 'legacy'  # default
-            doc_id_to_find = result.doc_id if hasattr(result, 'doc_id') else None
-            
-            if doc_id_to_find:
-                # Find the original document to get metadata (only works with InMemoryVectorStore)
-                if hasattr(self.vector_store, 'documents'):
-                    for doc in self.vector_store.documents.values():
-                        try:
-                            if hasattr(doc, 'doc_id') and doc.doc_id == doc_id_to_find:
-                                if hasattr(doc, 'metadata') and doc.metadata and isinstance(doc.metadata, dict):
-                                    chunk_type = doc.metadata.get('chunk_type', 'legacy')
-                                break
-                        except (AttributeError, TypeError):
-                            continue
-            
-            # Apply priority multiplier
-            multiplier = PRIORITY_MULTIPLIERS.get(chunk_type, 1.0)
-            result.combined_score *= multiplier
-        
-        # Sort by boosted combined score (descending)
+            self._apply_priority(result)
+
         results.sort(key=lambda r: r.combined_score, reverse=True)
-        
-        # Assign ranks
-        for i, result in enumerate(results[:top_k_final]):
-            result.rank = i + 1
-        
-        return results[:top_k_final]
-    
+        if deduplicate:
+            results = deduplicate_by_group(results)
+
+        top = results[:top_k_final]
+        for index, result in enumerate(top):
+            result.rank = index + 1
+
+        logger.info(
+            "query=%r beta=%.2f traversed=%s candidates=%d survived=%d returned=%d",
+            query_text[:60],
+            beta,
+            plan.scale_names,
+            len(candidates),
+            len(results),
+            len(top),
+        )
+        return top
+
+    def search_many(
+        self,
+        subqueries: Sequence[Tuple[str, Optional[TemporalInterval]]],
+        beta: Optional[float] = None,
+        top_k_final: int = 10,
+        max_workers: int = 8,
+        **kwargs: Any,
+    ) -> List[List[RetrievalResult]]:
+        """
+        Run several sub-queries concurrently, preserving input order.
+
+        A decomposed natural-language query — "Q1 impact on full year for 2021, 2022,
+        2023" becomes six sub-queries — issues its retrieval calls in parallel rather
+        than serially, since each is independent.
+        """
+        def run(item: Tuple[str, Optional[TemporalInterval]]) -> List[RetrievalResult]:
+            text, interval = item
+            return self.search(text, interval=interval, beta=beta, top_k_final=top_k_final, **kwargs)
+
+        if len(subqueries) == 1:
+            return [run(subqueries[0])]
+
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(subqueries))) as pool:
+            return list(pool.map(run, subqueries))
+
     def search_with_beta_sweep(
         self,
         query_text: str,
-        query_timestamp: Optional[datetime] = None,
+        interval: Optional[TemporalInterval] = None,
         beta_values: Optional[List[float]] = None,
-        top_k: int = 10
+        top_k: int = 10,
     ) -> List[Tuple[float, List[RetrievalResult]]]:
         """
-        Perform retrieval with multiple β values to demonstrate temporal zoom.
-        
-        This method shows how adjusting β smoothly transitions from broad
-        semantic search to temporally-focused retrieval.
-        
-        Args:
-            query_text: Query string
-            query_timestamp: Target timestamp
-            beta_values: List of β values to try (default: [0, 1, 5, 10, 20])
-            top_k: Number of results per β
-        
-        Returns:
-            List of (beta, results) tuples
+        Repeat a search across several β values to show the temporal-focus sweep.
+
+        Useful for demonstrating that β is a runtime knob, not a property baked into
+        the index.
         """
         if beta_values is None:
-            beta_values = [0, 1, 5, 10, 20]
-        
-        sweep_results = []
-        for beta in beta_values:
-            results = self.search(
-                query_text=query_text,
-                query_timestamp=query_timestamp,
-                beta=beta,
-                top_k_final=top_k
-            )
-            sweep_results.append((beta, results))
-        
-        return sweep_results
-    
-    def explain_result(self, result: RetrievalResult) -> str:
-        """
-        Generate human-readable explanation of a retrieval result.
-        
-        Args:
-            result: RetrievalResult to explain
-        
-        Returns:
-            Formatted explanation string
-        """
-        lines = [
-            f"Rank #{result.rank}",
-            f"Document ID: {result.doc_id}",
-            f"Timestamp: {result.timestamp.isoformat()}",
-            f"",
-            f"Scores:",
-            f"  Semantic Similarity: {result.semantic_score:.4f}",
-            f"  Temporal Alignment:  {result.temporal_alignment:.4f}",
-            f"  Combined Score:      {result.combined_score:.4f}",
-            f"",
-            f"Phase Information:",
-            f"  Document Phase (φ_doc):   {result.phi_doc:.4f} rad ({math.degrees(result.phi_doc):.1f}°)",
-            f"  Query Phase (φ_query):    {result.phi_query:.4f} rad ({math.degrees(result.phi_query):.1f}°)",
-            f"  Phase Difference (Δφ):    {result.phi_difference:.4f} rad ({math.degrees(result.phi_difference):.1f}°)",
-            f"",
-            f"Text Preview:",
-            f"  {result.text[:200]}..." if len(result.text) > 200 else f"  {result.text}"
+            beta_values = [0.0, 0.25, 0.5, 0.75, 1.0]
+        return [
+            (beta, self.search(query_text, interval=interval, beta=beta, top_k_final=top_k))
+            for beta in beta_values
         ]
-        return "\n".join(lines)
+
+    def explain_result(self, result: RetrievalResult) -> str:
+        """Human-readable breakdown of why a result scored as it did."""
+        return result.explain()
+
+
+def _concept_filter_clause(
+    concepts: Optional[List[str]],
+) -> Optional[Dict[str, Any]]:
+    """Build a metadata filter restricting fact chunks to the given XBRL concepts."""
+    if not concepts:
+        return None
+    return {
+        "$and": [
+            {"chunk_type": "fact"},
+            {
+                "$or": [
+                    {"concept": {"$in": concepts}},
+                    {"concept_full": {"$in": concepts}},
+                ]
+            },
+        ]
+    }
+
+
+# ============================================================================
+# Formatting
+# ============================================================================
 
 
 def format_results_table(
-    results: List[RetrievalResult],
-    max_text_length: int = 50
+    results: List[RetrievalResult], max_text_length: int = 44
 ) -> str:
-    """
-    Format retrieval results as a table.
-    
-    Args:
-        results: List of RetrievalResult objects
-        max_text_length: Maximum text preview length
-    
-    Returns:
-        Formatted table string
-    """
+    """Render results as a fixed-width table."""
     if not results:
         return "No results."
-    
-    # Header
-    lines = [
-        "┌────┬──────────┬─────────────┬───────────┬──────────┬" + "─" * (max_text_length + 2) + "┐",
-        f"│ #  │ Semantic │ Temporal    │ Combined  │ Δφ (deg) │ {'Text Preview'.ljust(max_text_length)} │",
-        "├────┼──────────┼─────────────┼───────────┼──────────┼" + "─" * (max_text_length + 2) + "┤",
-    ]
-    
-    # Rows
-    for result in results:
-        rank = str(result.rank).rjust(2)
-        semantic = f"{result.semantic_score:.4f}"
-        temporal = f"{result.temporal_alignment:.4f}"
-        combined = f"{result.combined_score:.4f}"
-        delta_deg = f"{math.degrees(result.phi_difference):.1f}"
-        
-        # Truncate text
-        text = result.text.replace("\n", " ")[:max_text_length]
-        text = text.ljust(max_text_length)
-        
-        lines.append(
-            f"│ {rank} │ {semantic} │ {temporal}   │ {combined} │ {delta_deg.rjust(8)} │ {text} │"
-        )
-    
-    # Footer
-    lines.append("└────┴──────────┴─────────────┴───────────┴──────────┴" + "─" * (max_text_length + 2) + "┘")
-    
-    return "\n".join(lines)
 
+    header = (
+        f"│ {'#':>2} │ {'Period':<21} │ {'Semantic':>8} │ {'Temporal':>8} │ "
+        f"{'Combined':>8} │ {'Text':<{max_text_length}} │"
+    )
+    rule = (
+        "─" * 4 + "┼" + "─" * 23 + "┼" + "─" * 10 + "┼" + "─" * 10 + "┼"
+        + "─" * 10 + "┼" + "─" * (max_text_length + 2)
+    )
+    lines = ["┌" + rule.replace("┼", "┬") + "┐", header, "├" + rule + "┤"]
+
+    for r in results:
+        if r.interval.end:
+            period = f"{r.interval.start.date()}→{r.interval.end.date()}"
+        else:
+            period = f"{r.interval.start.date()} (point)"
+        text = r.text.replace("\n", " ")[:max_text_length].ljust(max_text_length)
+        lines.append(
+            f"│ {r.rank:>2} │ {period:<21} │ {r.semantic_score:>8.4f} │ "
+            f"{r.temporal_alignment:>8.4f} │ {r.combined_score:>8.4f} │ {text} │"
+        )
+
+    lines.append("└" + rule.replace("┼", "┴") + "┘")
+    return "\n".join(lines)
