@@ -629,4 +629,4 @@ Robby Brodie — robbytherobot@redhat.com
   financial reporting (10-Q ⊂ 10-K) and time-series chunking.
 - Red Hat AI 3 (LlamaStack) for the Model Gateway API.
 - pgvector and Chroma for vector search; dateutil and FastAPI for the rest.
-- A special mention to Matt Hicks for his problem statement definaiton and encouragement
+- A special mention to Matt Hicks for his problem statement definition and encouragement
