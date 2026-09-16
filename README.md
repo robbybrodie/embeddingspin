@@ -620,9 +620,7 @@ re-index, and the code says so rather than implying otherwise.
 
 ---
 
-## Licence & credits
-
-MIT.
+## credits
 
 Robby Brodie — robbytherobot@redhat.com
 
